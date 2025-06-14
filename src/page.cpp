@@ -30,18 +30,15 @@ void Page::updateSlotDirectory() {
     }
 }
 
-char* Page::serialize() {
+std::vector<char> Page::serialize() {
     
     Page::updateHeaderToData();
     Page::updateSlotDirectory();
+    std::vector<char> buffer(PAGE_SIZE);
 
-    char* buffer = new char[PAGE_SIZE];
-    std::memset(buffer, 0, PAGE_SIZE);
-
-    // Copy actual page data (record bytes)
-    std::memcpy(buffer, data.data(), PAGE_SIZE);
+    std::memcpy(buffer.data(), data.data(), PAGE_SIZE);
     
-    return buffer;  // TODO: caller must delete[] this
+    return buffer;
 }
 
 Page Page::deserialize(const char* raw) {
@@ -60,10 +57,10 @@ Page Page::deserialize(const char* raw) {
     // Copy raw data buffer into page.data
     std::memcpy(page.data.data(), raw, PAGE_SIZE);
 
-    // Rebuild slot directory
+
     page.slot_directory.clear();
     for (int i = 0; i < num_slots; ++i) {
-        int slot_offset = PAGE_HEADER_SIZE + (i + 1) * SLOT_ENTRY_SIZE;
+        int slot_offset = PAGE_HEADER_SIZE + (i) * SLOT_ENTRY_SIZE;
 
 
         SlotEntry entry;
@@ -89,7 +86,7 @@ int Page::insertRecord(const std::string& record) {
     // Check if record can be inserted or not
     // std::cout << slot_start << " " << record_start << " " << record_end << "\n"; 
     if (record_start < slot_start) { // allowing exact PAGE_SIZE fit.
-        throw std::out_of_range("record too large. Can't insert record in this page");
+        // throw std::out_of_range("record too large. Can't insert record in this page");
         return -1;
     }
 
@@ -134,4 +131,14 @@ bool Page::deleteRecord(int slot_id) {
     }
     slot_directory[slot_id].is_active = 0;
     return true;
+}
+
+uint32_t Page::getPageId() const{
+    return page_id;
+}
+int Page::getFreeSpace() const{
+    return free_space_offset - (PAGE_HEADER_SIZE+ num_slots*SLOT_ENTRY_SIZE);
+}
+int Page::getNumSlots() const{
+    return num_slots+1;
 }

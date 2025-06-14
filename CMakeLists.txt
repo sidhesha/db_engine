@@ -21,6 +21,7 @@ set(SOURCES
     src/node.cpp
     src/pagemanager.cpp
     src/record.cpp
+    src/page.cpp
 )
 
 # Main executable

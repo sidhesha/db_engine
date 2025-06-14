@@ -25,10 +25,10 @@ public:
     std::string readRecord(int slot_id) const;
     bool deleteRecord(int slot_id);
 
-    char* serialize();
+    std::vector<char> serialize();
     uint32_t getPageId() const;
     int getFreeSpace() const;
-    int getNumSlots() const;
+    int getNumSlots() const; // 1 indexed
 
 private:
     uint32_t page_id;
