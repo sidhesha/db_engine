@@ -1,6 +1,5 @@
-CMakeFiles/db_engine.dir/main.cpp.obj: \
- C:\Users\sidhe\OneDrive\Desktop\db_engine\main.cpp \
- C:/Users/sidhe/OneDrive/Desktop/db_engine/include/pagemanager.hpp \
+CMakeFiles/db_engine.dir/src/page.cpp.obj: \
+ C:\Users\sidhe\OneDrive\Desktop\db_engine\src\page.cpp \
  C:/Users/sidhe/OneDrive/Desktop/db_engine/include/page.hpp \
  C:/msys64/ucrt64/include/c++/14.2.0/vector \
  C:/msys64/ucrt64/include/c++/14.2.0/bits/requires_hosted.h \
@@ -106,8 +105,8 @@ CMakeFiles/db_engine.dir/main.cpp.obj: \
  C:/msys64/ucrt64/include/c++/14.2.0/cstdint \
  C:/msys64/ucrt64/lib/gcc/x86_64-w64-mingw32/14.2.0/include/stdint.h \
  C:/msys64/ucrt64/include/stdint.h \
- C:/msys64/ucrt64/include/c++/14.2.0/fstream \
- C:/msys64/ucrt64/include/c++/14.2.0/istream \
+ C:/msys64/ucrt64/include/c++/14.2.0/iostream \
+ C:/msys64/ucrt64/include/c++/14.2.0/ostream \
  C:/msys64/ucrt64/include/c++/14.2.0/ios \
  C:/msys64/ucrt64/include/c++/14.2.0/exception \
  C:/msys64/ucrt64/include/c++/14.2.0/bits/exception_ptr.h \
@@ -147,11 +146,9 @@ CMakeFiles/db_engine.dir/main.cpp.obj: \
  C:/msys64/ucrt64/include/c++/14.2.0/x86_64-w64-mingw32/bits/ctype_inline.h \
  C:/msys64/ucrt64/include/c++/14.2.0/bits/locale_facets.tcc \
  C:/msys64/ucrt64/include/c++/14.2.0/bits/basic_ios.tcc \
- C:/msys64/ucrt64/include/c++/14.2.0/ostream \
  C:/msys64/ucrt64/include/c++/14.2.0/bits/ostream.tcc \
+ C:/msys64/ucrt64/include/c++/14.2.0/istream \
  C:/msys64/ucrt64/include/c++/14.2.0/bits/istream.tcc \
- C:/msys64/ucrt64/include/c++/14.2.0/bits/codecvt.h \
- C:/msys64/ucrt64/include/c++/14.2.0/x86_64-w64-mingw32/bits/basic_file.h \
- C:/msys64/ucrt64/include/c++/14.2.0/x86_64-w64-mingw32/bits/c++io.h \
- C:/msys64/ucrt64/include/c++/14.2.0/bits/fstream.tcc \
- C:/msys64/ucrt64/include/c++/14.2.0/iostream
+ C:/msys64/ucrt64/include/c++/14.2.0/cstring \
+ C:/msys64/ucrt64/include/string.h \
+ C:/msys64/ucrt64/include/sec_api/string_s.h

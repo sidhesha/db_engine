@@ -2,10 +2,10 @@
 	"artifacts" : 
 	[
 		{
-			"path" : "db_engine_test.exe"
+			"path" : "db_engine.exe"
 		},
 		{
-			"path" : "db_engine_test.pdb"
+			"path" : "db_engine.pdb"
 		}
 	],
 	"backtrace" : 1,
@@ -28,7 +28,7 @@
 			{
 				"command" : 0,
 				"file" : 0,
-				"line" : 30,
+				"line" : 28,
 				"parent" : 0
 			},
 			{
@@ -70,11 +70,12 @@
 				1,
 				2,
 				3,
-				4
+				4,
+				5
 			]
 		}
 	],
-	"id" : "db_engine_test::@6890427a1f51a3e7e1df",
+	"id" : "db_engine::@6890427a1f51a3e7e1df",
 	"link" : 
 	{
 		"commandFragments" : 
@@ -90,8 +91,8 @@
 		],
 		"language" : "CXX"
 	},
-	"name" : "db_engine_test",
-	"nameOnDisk" : "db_engine_test.exe",
+	"name" : "db_engine",
+	"nameOnDisk" : "db_engine.exe",
 	"paths" : 
 	{
 		"build" : ".",
@@ -107,7 +108,8 @@
 				1,
 				2,
 				3,
-				4
+				4,
+				5
 			]
 		}
 	],
@@ -116,7 +118,7 @@
 		{
 			"backtrace" : 1,
 			"compileGroupIndex" : 0,
-			"path" : "test.cpp",
+			"path" : "main.cpp",
 			"sourceGroupIndex" : 0
 		},
 		{
@@ -141,6 +143,12 @@
 			"backtrace" : 1,
 			"compileGroupIndex" : 0,
 			"path" : "src/record.cpp",
+			"sourceGroupIndex" : 0
+		},
+		{
+			"backtrace" : 1,
+			"compileGroupIndex" : 0,
+			"path" : "src/page.cpp",
 			"sourceGroupIndex" : 0
 		}
 	],

@@ -3,6 +3,8 @@ file(REMOVE_RECURSE
   "CMakeFiles/db_engine_test.dir/src/bplustree.cpp.obj.d"
   "CMakeFiles/db_engine_test.dir/src/node.cpp.obj"
   "CMakeFiles/db_engine_test.dir/src/node.cpp.obj.d"
+  "CMakeFiles/db_engine_test.dir/src/page.cpp.obj"
+  "CMakeFiles/db_engine_test.dir/src/page.cpp.obj.d"
   "CMakeFiles/db_engine_test.dir/src/pagemanager.cpp.obj"
   "CMakeFiles/db_engine_test.dir/src/pagemanager.cpp.obj.d"
   "CMakeFiles/db_engine_test.dir/src/record.cpp.obj"

@@ -219,6 +219,33 @@ src/node.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\db_engine_test.dir\build.make CMakeFiles/db_engine_test.dir/src/node.cpp.s
 .PHONY : src/node.cpp.s
 
+src/page.obj: src/page.cpp.obj
+.PHONY : src/page.obj
+
+# target to build an object file
+src/page.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\db_engine.dir\build.make CMakeFiles/db_engine.dir/src/page.cpp.obj
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\db_engine_test.dir\build.make CMakeFiles/db_engine_test.dir/src/page.cpp.obj
+.PHONY : src/page.cpp.obj
+
+src/page.i: src/page.cpp.i
+.PHONY : src/page.i
+
+# target to preprocess a source file
+src/page.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\db_engine.dir\build.make CMakeFiles/db_engine.dir/src/page.cpp.i
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\db_engine_test.dir\build.make CMakeFiles/db_engine_test.dir/src/page.cpp.i
+.PHONY : src/page.cpp.i
+
+src/page.s: src/page.cpp.s
+.PHONY : src/page.s
+
+# target to generate assembly for a file
+src/page.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\db_engine.dir\build.make CMakeFiles/db_engine.dir/src/page.cpp.s
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\db_engine_test.dir\build.make CMakeFiles/db_engine_test.dir/src/page.cpp.s
+.PHONY : src/page.cpp.s
+
 src/pagemanager.obj: src/pagemanager.cpp.obj
 .PHONY : src/pagemanager.obj
 
@@ -316,6 +343,9 @@ help:
 	@echo ... src/node.obj
 	@echo ... src/node.i
 	@echo ... src/node.s
+	@echo ... src/page.obj
+	@echo ... src/page.i
+	@echo ... src/page.s
 	@echo ... src/pagemanager.obj
 	@echo ... src/pagemanager.i
 	@echo ... src/pagemanager.s

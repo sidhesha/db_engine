@@ -11,6 +11,7 @@ set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "C:/Users/sidhe/OneDrive/Desktop/db_engine/main.cpp" "CMakeFiles/db_engine.dir/main.cpp.obj" "gcc" "CMakeFiles/db_engine.dir/main.cpp.obj.d"
   "C:/Users/sidhe/OneDrive/Desktop/db_engine/src/bplustree.cpp" "CMakeFiles/db_engine.dir/src/bplustree.cpp.obj" "gcc" "CMakeFiles/db_engine.dir/src/bplustree.cpp.obj.d"
   "C:/Users/sidhe/OneDrive/Desktop/db_engine/src/node.cpp" "CMakeFiles/db_engine.dir/src/node.cpp.obj" "gcc" "CMakeFiles/db_engine.dir/src/node.cpp.obj.d"
+  "C:/Users/sidhe/OneDrive/Desktop/db_engine/src/page.cpp" "CMakeFiles/db_engine.dir/src/page.cpp.obj" "gcc" "CMakeFiles/db_engine.dir/src/page.cpp.obj.d"
   "C:/Users/sidhe/OneDrive/Desktop/db_engine/src/pagemanager.cpp" "CMakeFiles/db_engine.dir/src/pagemanager.cpp.obj" "gcc" "CMakeFiles/db_engine.dir/src/pagemanager.cpp.obj.d"
   "C:/Users/sidhe/OneDrive/Desktop/db_engine/src/record.cpp" "CMakeFiles/db_engine.dir/src/record.cpp.obj" "gcc" "CMakeFiles/db_engine.dir/src/record.cpp.obj.d"
   )

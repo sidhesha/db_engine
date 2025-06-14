@@ -10,6 +10,7 @@ set(CMAKE_DEPENDS_LANGUAGES
 set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "C:/Users/sidhe/OneDrive/Desktop/db_engine/src/bplustree.cpp" "CMakeFiles/db_engine_test.dir/src/bplustree.cpp.obj" "gcc" "CMakeFiles/db_engine_test.dir/src/bplustree.cpp.obj.d"
   "C:/Users/sidhe/OneDrive/Desktop/db_engine/src/node.cpp" "CMakeFiles/db_engine_test.dir/src/node.cpp.obj" "gcc" "CMakeFiles/db_engine_test.dir/src/node.cpp.obj.d"
+  "C:/Users/sidhe/OneDrive/Desktop/db_engine/src/page.cpp" "CMakeFiles/db_engine_test.dir/src/page.cpp.obj" "gcc" "CMakeFiles/db_engine_test.dir/src/page.cpp.obj.d"
   "C:/Users/sidhe/OneDrive/Desktop/db_engine/src/pagemanager.cpp" "CMakeFiles/db_engine_test.dir/src/pagemanager.cpp.obj" "gcc" "CMakeFiles/db_engine_test.dir/src/pagemanager.cpp.obj.d"
   "C:/Users/sidhe/OneDrive/Desktop/db_engine/src/record.cpp" "CMakeFiles/db_engine_test.dir/src/record.cpp.obj" "gcc" "CMakeFiles/db_engine_test.dir/src/record.cpp.obj.d"
   "C:/Users/sidhe/OneDrive/Desktop/db_engine/test.cpp" "CMakeFiles/db_engine_test.dir/test.cpp.obj" "gcc" "CMakeFiles/db_engine_test.dir/test.cpp.obj.d"

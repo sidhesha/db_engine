@@ -31,6 +31,12 @@
 },
 {
   "directory": "C:/Users/sidhe/OneDrive/Desktop/db_engine/build",
+  "command": "C:\\msys64\\ucrt64\\bin\\g++.exe  @CMakeFiles/db_engine.dir/includes_CXX.rsp -g -g3 -O0 -std=gnu++17 -o CMakeFiles\\db_engine.dir\\src\\page.cpp.obj -c C:\\Users\\sidhe\\OneDrive\\Desktop\\db_engine\\src\\page.cpp",
+  "file": "C:/Users/sidhe/OneDrive/Desktop/db_engine/src/page.cpp",
+  "output": "CMakeFiles/db_engine.dir/src/page.cpp.obj"
+},
+{
+  "directory": "C:/Users/sidhe/OneDrive/Desktop/db_engine/build",
   "command": "C:\\msys64\\ucrt64\\bin\\g++.exe  @CMakeFiles/db_engine_test.dir/includes_CXX.rsp -g -g3 -O0 -std=gnu++17 -o CMakeFiles\\db_engine_test.dir\\test.cpp.obj -c C:\\Users\\sidhe\\OneDrive\\Desktop\\db_engine\\test.cpp",
   "file": "C:/Users/sidhe/OneDrive/Desktop/db_engine/test.cpp",
   "output": "CMakeFiles/db_engine_test.dir/test.cpp.obj"
@@ -58,5 +64,11 @@
   "command": "C:\\msys64\\ucrt64\\bin\\g++.exe  @CMakeFiles/db_engine_test.dir/includes_CXX.rsp -g -g3 -O0 -std=gnu++17 -o CMakeFiles\\db_engine_test.dir\\src\\record.cpp.obj -c C:\\Users\\sidhe\\OneDrive\\Desktop\\db_engine\\src\\record.cpp",
   "file": "C:/Users/sidhe/OneDrive/Desktop/db_engine/src/record.cpp",
   "output": "CMakeFiles/db_engine_test.dir/src/record.cpp.obj"
+},
+{
+  "directory": "C:/Users/sidhe/OneDrive/Desktop/db_engine/build",
+  "command": "C:\\msys64\\ucrt64\\bin\\g++.exe  @CMakeFiles/db_engine_test.dir/includes_CXX.rsp -g -g3 -O0 -std=gnu++17 -o CMakeFiles\\db_engine_test.dir\\src\\page.cpp.obj -c C:\\Users\\sidhe\\OneDrive\\Desktop\\db_engine\\src\\page.cpp",
+  "file": "C:/Users/sidhe/OneDrive/Desktop/db_engine/src/page.cpp",
+  "output": "CMakeFiles/db_engine_test.dir/src/page.cpp.obj"
 }
 ]
