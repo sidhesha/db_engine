@@ -140,5 +140,5 @@ int Page::getFreeSpace() const{
     return free_space_offset - (PAGE_HEADER_SIZE+ num_slots*SLOT_ENTRY_SIZE);
 }
 int Page::getNumSlots() const{
-    return num_slots+1;
+    return num_slots;
 }

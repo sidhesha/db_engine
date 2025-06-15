@@ -1,0 +1,1 @@
+constexpr int MAX_KEYS = 4;
