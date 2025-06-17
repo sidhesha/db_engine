@@ -1,25 +1,24 @@
-#include "node.hpp"
+#include "bplustree.hpp"
 #include <iostream>
-#include <vector>
 
 int main() {
-    std::shared_ptr leaf = std::make_shared<BPlusTreeNode>(true);  // is_leaf = true
+    BPlusTree tree;
 
-    std::vector<std::string> test_keys = {"frank", "alex", "bob", "eve", "david","carol" };
-    int page_id = 1;
+    std::vector<std::string> test_keys = {
+        "apple", "app", "application", "apex", "apply",
+        "bat", "batch", "banana", "band", "bang",
+        "cat", "catch", "cater", "category", "car",
+        "dog", "doll", "doom", "door", "dot"
+    };
 
+    std::cout << "=== Inserting keys ===\n";
     for (int i = 0; i < test_keys.size(); ++i) {
-        leaf->insertInLeaf(test_keys[i], page_id, i);
-        
-        if (leaf->isFull()) {
-            auto [split_key, new_node] = leaf->splitLeafNode();
-
-            std::cout << "Split occurred at key: " << split_key << "\n";
-            std::cout << "Left node:\n";
-            leaf->printNode();
-            std::cout << "Right node:\n";
-            new_node->printNode();
-        }
+        tree.insert(test_keys[i], i, i);
+        std::cout << "Inserted key: " << test_keys[i] << "\n";
     }
+
+    std::cout << "\n=== Tree Structure ===\n";
+    tree.printTree();
+
     return 0;
 }

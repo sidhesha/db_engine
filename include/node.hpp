@@ -2,8 +2,7 @@
 #include <vector>
 #include <string>
 #include <memory>
-#include "bplustree.hpp"
-
+#include "constants.hpp"
 
 struct RID {
     int page_id;
@@ -23,6 +22,7 @@ public:
     // If internal
     std::vector<std::shared_ptr<BPlusTreeNode>> children;
 
+    std::weak_ptr<BPlusTreeNode> parent; //parent pointer
     
     BPlusTreeNode(bool leaf = true);
     bool isFull() const;
@@ -30,7 +30,7 @@ public:
     void insertInLeaf(const std::string& key, int page_id, int slot_id);
     void printNode();
     std::pair<std::string, std::shared_ptr<BPlusTreeNode>> splitLeafNode();
-
+    std::pair<std::string, std::shared_ptr<BPlusTreeNode>> splitInternalNode();
 
     std::vector<char> serialize() const;
     static BPlusTreeNode deserialize(const std::vector<char>& data);
