@@ -6,7 +6,7 @@ BPlusTree::BPlusTree() {
     root = std::make_shared<BPlusTreeNode>(true);  // root is leaf at start
 }
 
-std::shared_ptr<BPlusTreeNode> BPlusTree::findLeafNode(const std::string& key) {
+std::shared_ptr<BPlusTreeNode> BPlusTree::findLeafNode(const Key& key) {
     auto current = root;
     while (!current->is_leaf) {
         int i = 0;
@@ -18,7 +18,7 @@ std::shared_ptr<BPlusTreeNode> BPlusTree::findLeafNode(const std::string& key) {
     return current;
 }
 
-void BPlusTree::insert(const std::string& key, int page_id, int slot_id) {
+void BPlusTree::insert(const Key& key, int page_id, int slot_id) {
     auto leaf = findLeafNode(key);
     leaf->insertInLeaf(key, page_id, slot_id);
 
@@ -41,7 +41,7 @@ void BPlusTree::insert(const std::string& key, int page_id, int slot_id) {
     }
 }
 
-void BPlusTree::insertInternal(const std::string& key,
+void BPlusTree::insertInternal(const Key& key,
                                std::shared_ptr<BPlusTreeNode> left_child,
                                std::shared_ptr<BPlusTreeNode> right_child)
 {

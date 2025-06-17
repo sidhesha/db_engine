@@ -13,7 +13,7 @@ bool BPlusTreeNode::isFull() const {
 }
 
 
-int BPlusTreeNode::findInsertPosition(const std::string& key) const {
+int BPlusTreeNode::findInsertPosition(const Key& key) const {
     auto it = std::lower_bound(keys.begin(), keys.end(), key);
     return it - keys.begin();
 }
@@ -30,7 +30,7 @@ BPlusTreeNode BPlusTreeNode::deserialize(const std::vector<char>& data) {
     return BPlusTreeNode();
 }
 
-void BPlusTreeNode::insertInLeaf(const std::string& key, int page_id, int slot_id){
+void BPlusTreeNode::insertInLeaf(const Key& key, int page_id, int slot_id){
     int pos = findInsertPosition(key);
     keys.insert(keys.begin() + pos, key);
     rids.insert(rids.begin() + pos, {page_id, slot_id});
@@ -47,22 +47,22 @@ void BPlusTreeNode::printNode() {
     std::cout << "Node ID: " << node_id << "\n";
     std::cout << "Keys: ";
     for (const auto& key : keys) {
-        std::cout << key << " ";
+        std::cout << key.toString() << " ";
     }
     std::cout << "\n";
 
     if (is_leaf) {
         for (size_t i = 0; i < keys.size(); ++i) {
-            std::cout << "Key: " << keys[i] << " -> (" << rids[i].page_id << ", " << rids[i].slot_id << ")\n";
+            std::cout << "Key: " << keys[i].toString() << " -> (" << rids[i].page_id << ", " << rids[i].slot_id << ")\n";
         }
     } else {
         std::cout << "Children:\n";
         for (size_t i = 0; i < children.size(); ++i) {
             if (children[i]) {
                 std::cout << "Child " << i << " -> First key: " 
-                          << (children[i]->keys.empty() ? "None" : children[i]->keys.front())
+                          << (children[i]->keys.empty() ? "None" : children[i]->keys.front().toString())
                           << ", Last key: " 
-                          << (children[i]->keys.empty() ? "None" : children[i]->keys.back())
+                          << (children[i]->keys.empty() ? "None" : children[i]->keys.back().toString())
                           << "\n";
             } else {
                 std::cout << "Child " << i << " -> NULL\n";
@@ -72,7 +72,7 @@ void BPlusTreeNode::printNode() {
 }
 
 // Returns the first key of new right node and its pointer
-std::pair<std::string, std::shared_ptr<BPlusTreeNode>> BPlusTreeNode::splitLeafNode() {
+std::pair<Key, std::shared_ptr<BPlusTreeNode>> BPlusTreeNode::splitLeafNode() {
     int mid = keys.size() / 2;
 
     // new right sibling leaf node
@@ -95,9 +95,9 @@ std::pair<std::string, std::shared_ptr<BPlusTreeNode>> BPlusTreeNode::splitLeafN
 }
 
 
-std::pair<std::string, std::shared_ptr<BPlusTreeNode>> BPlusTreeNode::splitInternalNode() {
+std::pair<Key, std::shared_ptr<BPlusTreeNode>> BPlusTreeNode::splitInternalNode() {
     int mid = keys.size() / 2;
-    std::string push_up_key = keys[mid];
+    Key push_up_key = keys[mid];
 
     auto new_node = std::make_shared<BPlusTreeNode>(false);
 

@@ -3,6 +3,7 @@
 #include <string>
 #include <memory>
 #include "constants.hpp"
+#include "key.hpp"
 
 struct RID {
     int page_id;
@@ -13,7 +14,7 @@ class BPlusTreeNode {
 public:
     bool is_leaf;
     int node_id;
-    std::vector<std::string> keys;
+    std::vector<Key> keys;
 
     // If leaf
     std::vector<RID> rids;
@@ -26,11 +27,11 @@ public:
     
     BPlusTreeNode(bool leaf = true);
     bool isFull() const;
-    int findInsertPosition(const std::string& key) const;
-    void insertInLeaf(const std::string& key, int page_id, int slot_id);
+    int findInsertPosition(const Key& key) const;
+    void insertInLeaf(const Key& key, int page_id, int slot_id);
     void printNode();
-    std::pair<std::string, std::shared_ptr<BPlusTreeNode>> splitLeafNode();
-    std::pair<std::string, std::shared_ptr<BPlusTreeNode>> splitInternalNode();
+    std::pair<Key, std::shared_ptr<BPlusTreeNode>> splitLeafNode();
+    std::pair<Key, std::shared_ptr<BPlusTreeNode>> splitInternalNode();
 
     std::vector<char> serialize() const;
     static BPlusTreeNode deserialize(const std::vector<char>& data);
