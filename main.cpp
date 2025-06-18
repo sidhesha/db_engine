@@ -1,45 +1,31 @@
-#include "bplustree.hpp"
+#include "record.hpp"
 #include <iostream>
+#include <cassert>
+
+void printFields(const std::vector<std::string>& fields) {
+    for (const auto& field : fields) {
+        std::cout << field << " | ";
+    }
+    std::cout << "\n";
+}
 
 int main() {
-    BPlusTree tree;
-
-    std::vector<std::string> test_keys = {
-        "door", "dot",
-        "catch", "cater", "apply",
-        "band", "bang", "cat","bat", "batch", "banana", 
-        "dog", "doll", "doom", "apple", "app", "application", "apex",
-        "category", "car"
+    std::vector<std::string> original_fields = {
+        "123", "John Doe", "john@example.com", "Software Engineer"
     };
 
-    // std::vector<int> test_keys = {
-    //     1,6,3,2,5,10,25,100,56,23,11
-    // };
+    Record rec(original_fields);
+    std::cout << "Original fields:\n";
+    printFields(rec.getFields());
 
-    std::cout << "=== Inserting keys ===\n";
-    for (int i = 0; i < test_keys.size(); ++i) {
-        tree.insert(test_keys[i], i, i);
-        std::cout << "Inserted key: " << test_keys[i] << "\n";
-    }
+    std::vector<char> serialized = rec.serialize();
+    std::cout << "Serialized size: " << serialized.size() << " bytes\n";
 
-    std::cout << "\n=== Tree Structure ===\n";
-    tree.printTree();
-    tree.update(Key("car"),10,20);
-    auto result = tree.search(Key("car"));
-    if (result) {
-        std::cout << "Found: page=" << result->page_id << ", slot=" << result->slot_id << "\n";
-    } else {
-        std::cout << "Key not found.\n";
-    }
-
-    // auto range_result = tree.rangeScan(Key("a"),Key("z"));
-    // auto range_result = tree.rangeScan(Key("batch"),Key("-"));
-    // auto range_result = tree.rangeScan(Key("-"),Key("cattox"));
-    auto range_result = tree.rangeScan(Key("batch"),Key("cat"));
-
-    for(auto [k,r]:range_result){
-        std::cout << "Key=" << k.toString() << " (page_id=" << r.page_id << " ,slot_id=" << r.slot_id << ")\n";
-    }
+    Record deserialized = Record::deserialize(serialized);
+    std::cout << "Deserialized fields:\n";
+    printFields(deserialized.getFields());
+    std::cout << "Size of deserialized record:" << deserialized.size() << "bytes\n";
+    assert(deserialized.size()==serialized.size()); 
 
     return 0;
 }
