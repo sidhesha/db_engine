@@ -76,6 +76,35 @@ void BPlusTree::insertInternal(const Key& key,
     }
 }
 
+std::optional<RID> BPlusTree::search(const Key& key) {
+    auto leaf = findLeafNode(key);
+    return leaf->findInLeaf(key);
+}
+
+bool BPlusTree::update(const Key& key, int new_page_id, int new_slot_id) {
+    auto leaf = findLeafNode(key);
+    return leaf->updateInLeaf(key, new_page_id, new_slot_id);
+}
+
+std::vector<std::pair<Key, RID>> 
+BPlusTree::rangeScan(const Key& low, const Key& high) {
+    std::vector<std::pair<Key, RID>> results;
+    auto leaf = findLeafNode(low);
+
+    while (leaf) {
+        for (size_t i = 0; i < leaf->keys.size(); i++) {
+            if (leaf->keys[i] >= low && leaf->keys[i] <= high) {
+                results.emplace_back(leaf->keys[i], leaf->rids[i]);
+            }
+            if (leaf->keys[i] > high) return results;
+        }
+        leaf = leaf->next_leaf;
+    }
+
+    return results;
+}
+
+
 void BPlusTree::printTree() const {
     std::cout << "B+ Tree Structure:\n";
     std::vector<std::shared_ptr<BPlusTreeNode>> level = { root };

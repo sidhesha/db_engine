@@ -11,6 +11,9 @@ public:
 
     void insert(const Key& key, int page_id, int slot_id);
     void printTree() const;
+    std::optional<RID> search(const Key& key);
+    bool update(const Key& key, int new_page_id, int new_slot_id);
+    std::vector<std::pair<Key, RID>> rangeScan(const Key& low, const Key& high);
 
 private:
     std::shared_ptr<BPlusTreeNode> root;

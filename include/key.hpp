@@ -28,6 +28,10 @@ public:
         return KeyTypeTag::STRING;
     }
 
+    bool operator>(const Key& other) const {
+        return compare(other) > 0;
+    }
+    
     bool operator<(const Key& other) const {
         return compare(other) < 0;
     }

@@ -2,6 +2,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <optional>
 #include "constants.hpp"
 #include "key.hpp"
 
@@ -32,6 +33,8 @@ public:
     void printNode();
     std::pair<Key, std::shared_ptr<BPlusTreeNode>> splitLeafNode();
     std::pair<Key, std::shared_ptr<BPlusTreeNode>> splitInternalNode();
+    std::optional<RID> findInLeaf(const Key& key) const;
+    bool updateInLeaf(const Key& key, int new_page_id, int new_slot_id);
 
     std::vector<char> serialize() const;
     static BPlusTreeNode deserialize(const std::vector<char>& data);

@@ -113,3 +113,24 @@ std::pair<Key, std::shared_ptr<BPlusTreeNode>> BPlusTreeNode::splitInternalNode(
 
     return {push_up_key, new_node};
 }
+
+
+std::optional<RID> BPlusTreeNode::findInLeaf(const Key& key) const {
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (keys[i] == key) {
+            return rids[i];
+        }
+    }
+    return std::nullopt;
+}
+
+bool BPlusTreeNode::updateInLeaf(const Key& key, int new_page_id, int new_slot_id) {
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (keys[i] == key) {
+            rids[i] = {new_page_id, new_slot_id};
+            return true;
+        }
+    }
+    return false;
+}
+
