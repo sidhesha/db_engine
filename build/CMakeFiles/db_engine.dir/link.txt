@@ -1,3 +1,0 @@
-"C:\Program Files\CMake\bin\cmake.exe" -E rm -f CMakeFiles\db_engine.dir/objects.a
-C:\msys64\ucrt64\bin\ar.exe qc CMakeFiles\db_engine.dir/objects.a @CMakeFiles\db_engine.dir\objects1.rsp
-C:\msys64\ucrt64\bin\g++.exe -g -g3 -O0 -Wl,--whole-archive CMakeFiles\db_engine.dir/objects.a -Wl,--no-whole-archive -o db_engine.exe -Wl,--out-implib,libdb_engine.dll.a -Wl,--major-image-version,0,--minor-image-version,0 @CMakeFiles\db_engine.dir\linkLibs.rsp
