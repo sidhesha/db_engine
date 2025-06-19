@@ -41,7 +41,7 @@ std::vector<char> Page::serialize() {
     return buffer;
 }
 
-Page Page::deserialize(const char* raw) {
+Page Page::deserialize(const std::vector<char> raw) {
 
     uint32_t page_id;
     uint16_t num_slots, free_space_offset;
@@ -55,7 +55,7 @@ Page Page::deserialize(const char* raw) {
     page.free_space_offset = free_space_offset;
 
     // Copy raw data buffer into page.data
-    std::memcpy(page.data.data(), raw, PAGE_SIZE);
+    std::memcpy(page.data.data(), raw.data(), PAGE_SIZE);
 
 
     page.slot_directory.clear();
@@ -75,7 +75,7 @@ Page Page::deserialize(const char* raw) {
 }
 
 
-int Page::insertRecord(const std::string& record) {
+int Page::insertRecord(const std::vector<char> record) {
     int record_len = record.size();
     int space_needed = record_len + SLOT_ENTRY_SIZE;
 
@@ -108,7 +108,7 @@ int Page::insertRecord(const std::string& record) {
     return num_slots - 1;  // return slot ID
 }
 
-std::string Page::readRecord(int slot_id) const {
+std::vector<char> Page::readRecord(int slot_id) const {
     if (slot_id < 0 || slot_id >= num_slots) {
         throw std::out_of_range("Invalid slot ID");
     }
@@ -117,7 +117,9 @@ std::string Page::readRecord(int slot_id) const {
     if (!entry.is_active) {
         throw std::runtime_error("Slot is deleted or inactive");
     }
-    return std::string(&data[entry.offset], entry.length);
+    std::vector<char> record(entry.length);
+    std::memcpy(record.data(),&data[entry.offset], entry.length);
+    return record;
 }
 
 

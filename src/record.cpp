@@ -1,7 +1,7 @@
-#pragma once
 #include "record.hpp"
 #include <stdexcept>
 #include <cstring>
+#include <iostream>
 
 Record::Record(const std::vector<std::string>& fields)
     : fields_(fields) {}

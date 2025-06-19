@@ -22,6 +22,7 @@ set(SOURCES
     src/pagemanager.cpp
     src/record.cpp
     src/page.cpp
+    src/recordmanager.cpp
 )
 
 # Main executable

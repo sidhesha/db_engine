@@ -19,10 +19,10 @@ struct SlotEntry {
 class Page {
 public:
     explicit Page(uint32_t page_id);
-    static Page deserialize(const char* raw);
+    static Page deserialize(const std::vector<char> raw);
 
-    int insertRecord(const std::string& data); // returns slot_id or -1
-    std::string readRecord(int slot_id) const;
+    int insertRecord(const std::vector<char> record); // returns slot_id or -1
+    std::vector<char> readRecord(int slot_id) const;
     bool deleteRecord(int slot_id);
 
     std::vector<char> serialize();

@@ -12,6 +12,7 @@ public:
     Page readPage(int page_id);
     void writePage(Page& page);
     int allocatePage();
+    int getNextPageId();
     void flush();
 
 private:

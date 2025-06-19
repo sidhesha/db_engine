@@ -38,10 +38,11 @@ void PageManager::openFile() {
 
 Page PageManager::readPage(int page_id) {
     Page page(page_id);
-    char buffer[PAGE_SIZE];
+    std::vector<char> buffer;
+    buffer.resize(PAGE_SIZE);
 
     file.seekg(page_id * PAGE_SIZE, std::ios::beg);
-    file.read(buffer, PAGE_SIZE);
+    file.read(buffer.data(), PAGE_SIZE);
 
     if (!file) {
         throw std::runtime_error("Failed to read page " + std::to_string(page_id));
@@ -73,3 +74,6 @@ void PageManager::flush() {
     file.flush();
 }
 
+int PageManager::getNextPageId(){
+    return next_page_id;
+}

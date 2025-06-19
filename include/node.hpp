@@ -6,10 +6,7 @@
 #include "constants.hpp"
 #include "key.hpp"
 
-struct RID {
-    int page_id;
-    int slot_id;
-};
+
 
 class BPlusTreeNode {
 public:
