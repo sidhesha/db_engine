@@ -23,6 +23,7 @@ set(SOURCES
     src/record.cpp
     src/page.cpp
     src/recordmanager.cpp
+    src/schema.cpp
 )
 
 # Main executable
