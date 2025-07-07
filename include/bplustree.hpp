@@ -14,7 +14,8 @@ public:
     std::optional<RID> search(const Key& key);
     bool update(const Key& key, int new_page_id, int new_slot_id);
     std::vector<std::pair<Key, RID>> rangeScan(const Key& low, const Key& high);
-
+    std::vector<std::pair<Key, RID>> getAllKeyRIDPairs() const;
+    bool remove(const Key& key);
 private:
     std::shared_ptr<BPlusTreeNode> root;
 

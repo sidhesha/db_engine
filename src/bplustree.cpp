@@ -122,3 +122,28 @@ void BPlusTree::printTree() const {
         level = next;
     }
 }
+
+
+std::vector<std::pair<Key, RID>> BPlusTree::getAllKeyRIDPairs() const {
+    std::vector<std::pair<Key, RID>> results;
+    auto current = root;
+    
+    // Navigate to the leftmost leaf
+    while (!current->is_leaf) {
+        current = current->children.front();
+    }
+    
+    // Traverse all leaves
+    while (current) {
+        for (size_t i = 0; i < current->keys.size(); ++i) {
+            results.emplace_back(current->keys[i], current->rids[i]);
+        }
+        current = current->next_leaf;
+    }
+    return results;
+}
+
+bool BPlusTree::remove(const Key& key){
+    // TODO: implement remove function
+    return false; // for now.s
+}

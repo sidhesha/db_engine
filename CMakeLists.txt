@@ -25,6 +25,7 @@ set(SOURCES
     src/recordmanager.cpp
     src/schema.cpp
     src/catalogmanager.cpp
+    src/table.cpp
 )
 
 # Main executable
