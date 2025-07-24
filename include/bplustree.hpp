@@ -2,7 +2,6 @@
 
 #include "node.hpp"
 #include <memory>
-#include <string>
 
 
 class BPlusTree {
@@ -19,6 +18,11 @@ public:
 private:
     std::shared_ptr<BPlusTreeNode> root;
 
+    void propagateSeparatorUpdate(std::shared_ptr<BPlusTreeNode> child, const Key& old_sep, const Key& new_sep);
+
+    void handleLeafUnderflow(std::shared_ptr<BPlusTreeNode> node);
+    void handleInternalUnderflow(std::shared_ptr<BPlusTreeNode> node);
+    
     void insertInternal(const Key& key,
                         std::shared_ptr<BPlusTreeNode> left_child,
                         std::shared_ptr<BPlusTreeNode> right_child);

@@ -12,6 +12,11 @@ bool BPlusTreeNode::isFull() const {
     return keys.size() > ORDER-1; //m-1 keys at max
 }
 
+bool BPlusTreeNode::isUnderflow() const {
+    return keys.size() < (ORDER - 1) / 2;
+}
+
+
 
 int BPlusTreeNode::findInsertPosition(const Key& key) const {
     auto it = std::lower_bound(keys.begin(), keys.end(), key);

@@ -1,6 +1,5 @@
 #pragma once
 #include <vector>
-#include <string>
 #include <memory>
 #include <optional>
 #include "constants.hpp"
@@ -25,6 +24,7 @@ public:
     
     BPlusTreeNode(bool leaf = true);
     bool isFull() const;
+    bool isUnderflow() const;
     int findInsertPosition(const Key& key) const;
     void insertInLeaf(const Key& key, int page_id, int slot_id);
     void printNode();
