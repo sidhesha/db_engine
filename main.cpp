@@ -16,7 +16,7 @@ void testDeletionStress() {
     // tree.remove(7);
     // tree.printTree();
     // Delete a few keys one by one
-    std::vector<int> to_delete = {5, 1, 20, 10, 3, 4, 6, 7, 2, 8, 9, 11};
+    std::vector<int> to_delete = {7, 1, 20, 10, 3, 4, 6, 5, 2, 8, 9, 11};
     for (int key : to_delete) {
         std::cout << "\n--- Deleting key: " << key << " ---\n";
         tree.remove(key);

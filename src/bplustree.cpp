@@ -1,5 +1,6 @@
 #include "bplustree.hpp"
 #include "constants.hpp"
+#include "key.hpp"
 #include <algorithm>
 #include <queue>
 #include <iostream>
@@ -199,9 +200,11 @@ bool BPlusTree::remove(const Key& key) {
     leaf->keys.erase(it);
     leaf->rids.erase(leaf->rids.begin() + idx);
 
+
     // If the deleted key was the first key, update parent separator
-    if (idx == 0 && !leaf->keys.empty()) {
-        propagateSeparatorUpdate(leaf, key, leaf->keys.front());
+    if (idx == 0) {
+        if(!leaf->keys.empty()) propagateSeparatorUpdate(leaf, key, leaf->keys.front());
+        else if(leaf->next_leaf) propagateSeparatorUpdate(leaf, key, leaf->next_leaf->keys.front());
     }
 
     // Root special case
@@ -369,7 +372,6 @@ void BPlusTree::propagateSeparatorUpdate(std::shared_ptr<BPlusTreeNode> child, c
     for (size_t i = 0; i < parent->keys.size(); ++i) {
         if (parent->keys[i] == old_sep) {
             parent->keys[i] = new_sep;
-            // If this separator is also the first key in the parent, propagate up
             return;
         }
     }
