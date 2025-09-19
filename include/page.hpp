@@ -1,10 +1,10 @@
 #pragma once
 
 #include <vector>
-#include <string>
+#include <constants.hpp>
 #include <cstdint>
 
-const int PAGE_SIZE = 4096;         // Fixed size of each page
+// const int PAGE_SIZE = 4096;         // Fixed size of each page
 const int PAGE_HEADER_SIZE = 8;     // 4 bytes page_id + 2 bytes num_slots + 2 bytes free_space_offset
 const int SLOT_ENTRY_SIZE = 5;      // 2 bytes offset + 2 bytes length + 1 byte is_active
 

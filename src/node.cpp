@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include "constants.hpp"
 
 
 BPlusTreeNode::BPlusTreeNode(bool leaf)
@@ -23,16 +24,157 @@ int BPlusTreeNode::findInsertPosition(const Key& key) const {
     return it - keys.begin();
 }
 
-// TODO:Dummy for now
 std::vector<char> BPlusTreeNode::serialize() const {
-    std::vector<char> buffer;
+    std::vector<char> buffer(PAGE_SIZE, 0); // fixed page size
+    std::size_t offset = 0;
+
+    auto write_int = [&](int value) {
+        std::memcpy(buffer.data() + offset, &value, sizeof(int));
+        offset += sizeof(int);
+    };
+
+    auto write_bool = [&](bool value) {
+        char b = value ? 1 : 0;
+        std::memcpy(buffer.data() + offset, &b, sizeof(char));
+        offset += 4; // align to 4 bytes
+    };
+
+    // Header
+    // node_id + is_leaf + num_keys + padding = 32 bytes
+    write_int(node_id); 
+    write_bool(is_leaf); 
+    write_int(static_cast<int>(keys.size()));
+
+    // padding up to 32 bytes
+    offset = 32;
+
+    // Keys
+    for (const auto& key : keys) {
+        int type_tag = static_cast<int>(key.getType());
+        write_int(type_tag);
+
+        switch (key.getType()) {
+            case KeyTypeTag::INTEGER:
+                write_int(std::get<int>(key.value));
+                break;
+            case KeyTypeTag::FLOAT: {
+                float f = std::get<float>(key.value);
+                std::memcpy(buffer.data() + offset, &f, sizeof(float));
+                offset += sizeof(float);
+                break;
+            }
+            case KeyTypeTag::STRING: {
+                std::string str = std::get<std::string>(key.value);
+                int len = static_cast<int>(str.size());
+                write_int(len);
+                std::memcpy(buffer.data() + offset, str.data(), len);
+                offset += len;
+                break;
+            }
+        }
+    }
+
+    // Payload
+    if (is_leaf) {
+        for (const auto& rid : rids) {
+            write_int(rid.page_id);
+            write_int(rid.slot_id);
+        }
+    } else {
+        for (const auto& child : children) {
+            int child_id = child ? child->node_id : -1;
+            write_int(child_id);
+        }
+    }
+
     return buffer;
 }
 
-// TODO:dummy for now
 BPlusTreeNode BPlusTreeNode::deserialize(const std::vector<char>& data) {
-    
-    return BPlusTreeNode();
+    if (data.size() < PAGE_SIZE) {
+        throw std::runtime_error("Invalid page size for node deserialization");
+    }
+
+    BPlusTreeNode node;
+
+    std::size_t offset = 0;
+
+    auto read_int = [&](int& value) {
+        std::memcpy(&value, data.data() + offset, sizeof(int));
+        offset += sizeof(int);
+    };
+
+    auto read_bool = [&](bool& value) {
+        char b;
+        std::memcpy(&b, data.data() + offset, sizeof(char));
+        offset += 4; // aligned
+        value = (b != 0);
+    };
+
+    // Header
+    read_int(node.node_id);
+    read_bool(node.is_leaf);
+    int num_keys;
+    read_int(num_keys);
+
+    offset = 32;
+
+    // Keys
+    node.keys.clear();
+    for (int i = 0; i < num_keys; i++) {
+        Key key;
+        int type_tag;
+        read_int(type_tag);
+        switch (type_tag) {
+            case 0: // INTEGER
+                int int_val;
+                read_int(int_val);
+                key.value = int_val;
+                break;
+            case 1: // FLOAT
+                float f;
+                std::memcpy(&f, data.data() + offset, sizeof(float));
+                offset += sizeof(float);
+                key.value = f;
+                break;
+            case 2: // STRING
+                int len;
+                read_int(len);
+                std::string str(len, '\0');
+                std::memcpy(str.data(), data.data() + offset, len);
+                offset += len;
+                key.value = str;
+                break;
+        }
+        node.keys.push_back(key);
+    }
+
+    // Payload
+    if (node.is_leaf) {
+        node.rids.clear();
+        for (int i = 0; i < num_keys; i++) {
+            RID rid;
+            read_int(rid.page_id);
+            read_int(rid.slot_id);
+            node.rids.push_back(rid);
+        }
+    } else {
+        node.children.clear();
+        for (int i = 0; i < num_keys + 1; i++) {
+            int child_id;
+            read_int(child_id);
+            if (child_id != -1) {
+                // TODO: will be re-linked by IndexManager later
+                auto child = std::make_shared<BPlusTreeNode>();
+                child->node_id = child_id;
+                node.children.push_back(child);
+            } else {
+                node.children.push_back(nullptr);
+            }
+        }
+    }
+
+    return node;
 }
 
 void BPlusTreeNode::insertInLeaf(const Key& key, int page_id, int slot_id){
