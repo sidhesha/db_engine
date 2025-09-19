@@ -1,42 +1,40 @@
 #include "bplustree.hpp"
 #include <algorithm>
-#include <iostream>
+#include <iostream> 
+#include <cassert>
 
-void testDeletionStress() {
-    BPlusTree tree;
 
-    // Insert 20 keys
-    for (int i = 1; i <= 20; ++i) {
-        tree.insert(int(i), i, 0);
+
+void testSerializeDeserialize() {
+    auto node = std::make_shared<BPlusTreeNode>(true);
+    node->node_id = 1;
+    node->is_leaf = true;
+    
+    node->keys = {Key("asdas"), Key("fdgdug"), Key("saodhd")};
+    node->rids = { {1,1}, {1,2}, {1,3} };
+
+    // Serialize
+    auto data = node->serialize();
+    
+    // Deserialize
+    BPlusTreeNode restored = BPlusTreeNode::deserialize(data);
+
+
+    restored.printNode();
+    
+    assert(restored.keys == node->keys);
+    assert(restored.rids.size() == node->rids.size());
+    for (size_t i = 0; i < node->rids.size(); i++) {
+        assert(restored.rids[i].page_id == node->rids[i].page_id);
+        assert(restored.rids[i].slot_id == node->rids[i].slot_id);
     }
 
-    std::cout << "\nInitial tree after insertion:\n";
-    tree.printTree();
-
-    // tree.remove(7);
-    // tree.printTree();
-    // Delete a few keys one by one
-    std::vector<int> to_delete = {7, 1, 20, 10, 3, 4, 6, 5, 2, 8, 9, 11};
-    for (int key : to_delete) {
-        std::cout << "\n--- Deleting key: " << key << " ---\n";
-        tree.remove(key);
-        tree.printTree();
-    }
-
-    // Final deletes to trigger root collapse
-    for (int key = 12; key <= 19; ++key) {
-        std::cout << "\n--- Deleting key: " << key << " ---\n";
-        tree.remove(key);
-        tree.printTree();
-    }
-    tree.insert(int(3), 0, 0);
-    std::cout << "\nFinal tree (should be empty or root-only):\n";
-    tree.printTree();
-
+    std::cout << "Serialize/Deserialize round-trip test passed" << std::endl;
 }
 
 
+
 int main() {
-    testDeletionStress();
+    testSerializeDeserialize();
     return 0;
 }
