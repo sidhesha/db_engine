@@ -1,2 +1,4 @@
 /build/
 .cache/
+*.db
+test_catalog.txt
