@@ -9,6 +9,7 @@
 #include "indexmanager.hpp"
 #include "catalogmanager.hpp"
 #include "pagemanager.hpp"
+#include "bufferpool.hpp"
 #include "recordmanager.hpp"
 #include "table.hpp"
 
@@ -632,6 +633,103 @@ static void test_bpt_persist_empty() {
     std::remove(file.c_str());
 }
 
+// ─── BufferPool ──────────────────────────────────────────────────────────────
+
+static void test_bp_fetch_unpin() {
+    const std::string file = "bp_fetch.db";
+    std::remove(file.c_str());
+    TEST("fetch and unpin cycle") {
+        BufferPool bp(file);
+        int id = bp.allocatePage();
+        Page& p = bp.fetchPage(id);
+        assert(p.getPageId() == (uint32_t)id);
+        bp.unpinPage(id, false);
+        bp.flush();
+    } END_TEST;
+    std::remove(file.c_str());
+}
+
+static void test_bp_write_readback() {
+    const std::string file = "bp_rw.db";
+    std::remove(file.c_str());
+    TEST("write data and read back") {
+        BufferPool bp(file);
+        int id = bp.allocatePage();
+        {
+            Page& p = bp.fetchPage(id);
+            p.insertRecord({'h', 'i'});
+            bp.unpinPage(id, true);
+        }
+        bp.flush();
+
+        BufferPool bp2(file);
+        Page& p2 = bp2.fetchPage(id);
+        auto rec = p2.readRecord(0);
+        assert(rec.size() == 2 && rec[0] == 'h');
+        bp2.unpinPage(id, false);
+    } END_TEST;
+    std::remove(file.c_str());
+}
+
+static void test_bp_eviction() {
+    const std::string file = "bp_evict.db";
+    std::remove(file.c_str());
+    TEST("eviction reuses frames") {
+        BufferPool bp(file);
+        // Allocate more pages than frames to force eviction
+        int ids[100];
+        for (int i = 0; i < 100; i++) {
+            ids[i] = bp.allocatePage();
+            Page& p = bp.fetchPage(ids[i]);
+            bp.unpinPage(ids[i], false);
+        }
+        // All pages should still be readable (eviction writes them back)
+        for (int i = 0; i < 100; i++) {
+            Page& p = bp.fetchPage(ids[i]);
+            assert(p.getPageId() == (uint32_t)ids[i]);
+            bp.unpinPage(ids[i], false);
+        }
+    } END_TEST;
+    std::remove(file.c_str());
+}
+
+static void test_bp_dirty_flush() {
+    const std::string file = "bp_dirty.db";
+    std::remove(file.c_str());
+    TEST("dirty pages survive flush and reopen") {
+        int id;
+        {
+            BufferPool bp(file);
+            id = bp.allocatePage();
+            Page& p = bp.fetchPage(id);
+            p.insertRecord({'x', 'y', 'z'});
+            bp.unpinPage(id, true);
+            bp.flush();
+        }
+        {
+            BufferPool bp(file);
+            Page& p = bp.fetchPage(id);
+            auto rec = p.readRecord(0);
+            assert(rec.size() == 3);
+            bp.unpinPage(id, false);
+        }
+    } END_TEST;
+    std::remove(file.c_str());
+}
+
+static void test_bp_sequential_ids() {
+    const std::string file = "bp_seq.db";
+    std::remove(file.c_str());
+    TEST("sequential page IDs") {
+        BufferPool bp(file);
+        assert(bp.allocatePage() == 0);
+        assert(bp.allocatePage() == 1);
+        assert(bp.allocatePage() == 2);
+        assert(bp.getNextPageId() == 3);
+    } END_TEST;
+    std::remove(file.c_str());
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -643,6 +741,9 @@ int main() {
     std::cout << "=== BPlusTree ===\n";    test_bplustree();
     std::cout << "=== CatalogManager ===\n";
     test_catalog_basic(); test_catalog_persist(); test_catalog_dup(); test_catalog_missing();
+    std::cout << "=== BufferPool ===\n";
+    test_bp_fetch_unpin(); test_bp_write_readback(); test_bp_eviction(); test_bp_dirty_flush(); test_bp_sequential_ids();
+
     std::cout << "=== PageManager ===\n";
     test_pm_alloc(); test_pm_readback(); test_pm_multi();
     std::cout << "=== RecordManager ===\n";

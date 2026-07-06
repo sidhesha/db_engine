@@ -1,79 +1,35 @@
 #include "pagemanager.hpp"
-#include <iostream>
-#include <filesystem>
 #include <cstring>
 
-PageManager::PageManager(const std::string& fname): filename(fname), next_page_id(0) {
-    openFile();
-
-    // Set next_page_id based on file size
-    std::filesystem::path path(filename);
-    if (std::filesystem::exists(path)) {
-        std::uintmax_t filesize = std::filesystem::file_size(path);
-        next_page_id = filesize / PAGE_SIZE;
-    }
-}
+PageManager::PageManager(const std::string& fname)
+    : buffer_pool(fname) {}
 
 PageManager::~PageManager() {
-    flush();
-    file.close();
+    buffer_pool.flush();
 }
-
-void PageManager::openFile() {
-    file.open(filename, std::ios::in | std::ios::out | std::ios::binary);
-
-    // If file doesn't exist, create it
-    if (!file.is_open()) {
-        file.clear();
-        file.open(filename, std::ios::out | std::ios::binary);
-        file.close();
-        file.open(filename, std::ios::in | std::ios::out | std::ios::binary);
-    }
-
-    if (!file.is_open()) {
-        throw std::runtime_error("Failed to open file: " + filename);
-    }
-}
-
 
 Page PageManager::readPage(int page_id) {
-    Page page(page_id);
-    std::vector<char> buffer;
-    buffer.resize(PAGE_SIZE);
-
-    file.seekg(page_id * PAGE_SIZE, std::ios::beg);
-    file.read(buffer.data(), PAGE_SIZE);
-
-    if (!file) {
-        throw std::runtime_error("Failed to read page " + std::to_string(page_id));
-    }
-
-    page = page.deserialize(buffer);
-    return page;
+    Page& cached = buffer_pool.fetchPage(page_id);
+    std::vector<char> data = cached.serialize();
+    buffer_pool.unpinPage(page_id, false);
+    return Page::deserialize(data);
 }
 
 void PageManager::writePage(Page& page) {
-    std::vector<char> buffer = page.serialize();
-
-    file.seekp(page.getPageId() * PAGE_SIZE, std::ios::beg);
-    file.write(buffer.data(), PAGE_SIZE);
-
-    if (!file) {
-        throw std::runtime_error("Failed to write page " + std::to_string(page.getPageId()));
-    }
+    std::vector<char> data = page.serialize();
+    Page& cached = buffer_pool.fetchPage(page.getPageId());
+    cached = Page::deserialize(data);
+    buffer_pool.unpinPage(page.getPageId(), true);
 }
 
 int PageManager::allocatePage() {
-    int page_id = next_page_id++;
-    Page new_page(page_id);
-    writePage(new_page); // Write an empty page to disk
-    return page_id;
+    return buffer_pool.allocatePage();
+}
+
+int PageManager::getNextPageId() {
+    return buffer_pool.getNextPageId();
 }
 
 void PageManager::flush() {
-    file.flush();
-}
-
-int PageManager::getNextPageId(){
-    return next_page_id;
+    buffer_pool.flush();
 }

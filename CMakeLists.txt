@@ -26,6 +26,7 @@ set(SOURCES
     src/recordmanager.cpp
     src/schema.cpp
     src/catalogmanager.cpp
+    src/bufferpool.cpp
     src/table.cpp
 )
 

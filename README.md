@@ -37,8 +37,9 @@ Everything you need is in [`AGENTS.md`](./AGENTS.md):
 ## Features
 
 - B+ Tree index (key-based search, insert, delete, range scan, persistence)
+- Buffer pool with clock-sweep eviction (64-frame page cache, pin/unpin contract)
 - Page-based disk storage with slot directories
 - Record CRUD (insert, read, delete by key)
 - Persistent catalog (table schemas saved to file)
 - B+ tree survives process restarts (serialized to disk via `IndexManager`)
-- Modular design: index / storage / catalog / schema are decoupled
+- Modular design: index / storage / buffer pool / catalog / schema are decoupled
