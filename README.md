@@ -1,6 +1,6 @@
 # B+ Tree Database Engine
 
-A minimal database engine written in C++17 with B+ tree indexing, page-based storage, and catalog management.
+A minimal database engine written in C++17 with B+ tree indexing, page-based storage, disk-persistent indexes, and catalog management.
 
 ## Quick Start
 
@@ -36,8 +36,9 @@ Everything you need is in [`AGENTS.md`](./AGENTS.md):
 
 ## Features
 
-- B+ Tree index (key-based search, insert, delete, range scan)
+- B+ Tree index (key-based search, insert, delete, range scan, persistence)
 - Page-based disk storage with slot directories
 - Record CRUD (insert, read, delete by key)
 - Persistent catalog (table schemas saved to file)
+- B+ tree survives process restarts (serialized to disk via `IndexManager`)
 - Modular design: index / storage / catalog / schema are decoupled

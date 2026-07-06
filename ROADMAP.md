@@ -5,15 +5,17 @@ Each phase builds on the previous. Every phase is independently demo-able in an 
 
 ---
 
-## Phase 1: Persist the B+ Tree  (≈ 2-3 coding sessions)
+## ✅ Phase 1: Persist the B+ Tree (COMPLETE)
 **What:** Wire up `IndexManager` so the B+ tree survives process restarts.
-**Why:** Currently the tree is in-memory — lose power, lose the index. This is the #1 gap.
+**Why:** The tree was in-memory — lose power, lose the index. This was the #1 gap.
 
-**Plan:**
-- `BPlusTree` gets a `save()` / `load(IndexManager&)` or a constructor that takes `IndexManager&` and auto-loads
-- On every insert/remove/update, persist the affected nodes (or lazy-write on flush)
-- `IndexManager` already has `loadNode`, `saveNode`, `allocateNodeID` — just needs connecting
-- Add a test that inserts 20 keys, destroys the tree, reloads from disk, asserts all keys survive
+**Done:**
+- `BPlusTree(IndexManager&)` constructor auto-loads from disk if data exists
+- `save()` / `load()` persist and reconstruct the full tree (including `next_leaf` chain)
+- Every `insert`/`update`/`remove` triggers an automatic full-tree save
+- `IndexManager` header stores `root_node_id` so the root is always known after restarts
+- Empty tree handled: `root_node_id = -1` on disk
+- 10 tests cover: 20-key round-trip, range scan, getAll, update, remove, empty tree
 
 **Systems concept taught:** Serialization, disk layout, the memory-storage boundary.
 
@@ -107,6 +109,13 @@ Each phase builds a sentence you can say in an interview. No fluff.
 
 ---
 
-## Recommendation
+## Progress
 
-Start with **Phase 1** — it's the smallest change with the biggest impact. The `IndexManager` stub already exists; you just need to hook it into `BPlusTree`. Once that's done, everything else unlocks.
+| Phase | Status |
+|-------|--------|
+| 1 — Persist the B+ Tree | ✅ Done |
+| 2 — Buffer Pool | 🔜 Next |
+| 3 — Write-Ahead Log | ⏳ |
+| 4 — Simple Transactions | ⏳ |
+| 5 — SQL Frontend | ⏳ |
+| 6 — Benchmarking & Polish | ⏳ |

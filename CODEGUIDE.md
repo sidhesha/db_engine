@@ -20,10 +20,10 @@ build\db_engine_test.exe
 | **PageManager** | `pagemanager.hpp`, `pagemanager.cpp` | File I/O for pages. Allocate, read, write by page_id. Opens file on construction. |
 | **RecordManager** | `recordmanager.hpp`, `recordmanager.cpp` | Insert/read/delete Record objects using PageManager. Auto-allocates pages. |
 | **BPlusTreeNode** | `node.hpp`, `node.cpp` | Node with keys + RIDs (leaf) or keys + children (internal). Split, merge, serialize. |
-| **BPlusTree** | `bplustree.hpp`, `bplustree.cpp` | In-memory B+ tree index. Insert, search, update, rangeScan, remove. |
+| **BPlusTree** | `bplustree.hpp`, `bplustree.cpp` | B+ tree index with optional disk persistence. Insert, search, update, rangeScan, remove, save, load. |
 | **CatalogManager** | `catalogmanager.hpp`, `catalogmanager.cpp` | Table schema catalog. Saves/loads from text file. |
 | **Table** | `table.hpp`, `table.cpp` | High-level API combining RecordManager + BPlusTree. Insert/getByKey/deleteByKey. |
-| **IndexManager** | `indexmanager.hpp` | NOT USED. Stub for persisting B+ tree to disk. |
+| **IndexManager** | `indexmanager.hpp`, `indexmanager.cpp` | Persists B+ tree nodes to disk. Allocates node IDs, saves/loads individual nodes, stores root_node_id header. |
 | **constants.hpp** | — | ORDER, PAGE_SIZE, RID struct. |
 
 ## Key Patterns
@@ -64,7 +64,9 @@ Uses `passed`/`failed` globals with try/catch. No test framework dependency.
 - `BPlusTree::remove()` has underflow handling but no rebalancing for root-as-leaf edge case fully tested
 - `RecordManager::insertRecord()` scans all existing pages linearly before allocating new
 - `Table::deleteByKey()` calls `BPlusTree::remove()` which is the `remove` method
-- `IndexManager` exists but is never wired up — B+ tree is entirely in-memory
+- `IndexManager` stores a 4-byte `root_node_id` header at offset 0; nodes start at offset `PAGE_SIZE`
+- `BPlusTree(IndexManager&)` auto-loads; `save()` persists the entire tree; `load()` reconstructs `next_leaf` chain
+- `IndexManager::loadNode()` returns stubs for internal-node children — `BPlusTree::load()` recursively loads them
 
 ## PR Workflow
 1. Branch from `main`
