@@ -113,6 +113,7 @@ No shortcuts — each concept mirrors how a real database (PostgreSQL/InnoDB) wo
 - YCSB-style workload A (50% read / 50% update)
 - Compare: no buffer pool vs. buffer pool → shows your cache works
 - Compare: single-threaded vs. B-link concurrent → shows your latching works
+- **Eviction policy shootout: clock-sweep vs. LRU-2** — implement a pluggable `EvictionPolicy` interface so both policies can be swapped at runtime. LRU-2 tracks the 2nd-most-recent access time per page to prevent scan pollution (a single range scan won't evict hot internal nodes).
 - fuzz testing: random operations, assert no crash
 
 ---
