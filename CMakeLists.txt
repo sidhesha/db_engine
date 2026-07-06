@@ -18,6 +18,7 @@ include_directories(include)
 # Source files
 set(SOURCES
     src/bplustree.cpp
+    src/indexmanager.cpp
     src/node.cpp
     src/pagemanager.cpp
     src/record.cpp

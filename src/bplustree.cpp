@@ -6,8 +6,18 @@
 #include <iostream>
 
 
-BPlusTree::BPlusTree() {
+BPlusTree::BPlusTree()
+    : im(nullptr) {
     root = std::make_shared<BPlusTreeNode>(true);  // root is leaf at start
+}
+
+BPlusTree::BPlusTree(IndexManager& indexManager)
+    : im(&indexManager) {
+    if (im->hasData()) {
+        load();
+    } else {
+        root = std::make_shared<BPlusTreeNode>(true);
+    }
 }
 
 std::shared_ptr<BPlusTreeNode> BPlusTree::findLeafNode(const Key& key) {
@@ -47,6 +57,8 @@ void BPlusTree::insert(const Key& key, int page_id, int slot_id) {
             insertInternal(split_key, leaf, new_leaf);
         }
     }
+
+    maybeSave();
 }
 
 void BPlusTree::insertInternal(const Key& key,
@@ -93,7 +105,9 @@ std::optional<RID> BPlusTree::search(const Key& key) {
 bool BPlusTree::update(const Key& key, int new_page_id, int new_slot_id) {
     auto leaf = findLeafNode(key);
     if (!leaf) return false;
-    return leaf->updateInLeaf(key, new_page_id, new_slot_id);
+    bool ok = leaf->updateInLeaf(key, new_page_id, new_slot_id);
+    if (ok) maybeSave();
+    return ok;
 }
 
 std::vector<std::pair<Key, RID>> 
@@ -216,6 +230,7 @@ bool BPlusTree::remove(const Key& key) {
     // Root special case
     if (leaf == root && leaf->keys.empty()) {
         root = nullptr;
+        maybeSave();
         return true;
     }
 
@@ -224,6 +239,7 @@ bool BPlusTree::remove(const Key& key) {
         handleLeafUnderflow(leaf);
     }
 
+    maybeSave();
     return true;
 }
 
@@ -382,4 +398,79 @@ void BPlusTree::propagateSeparatorUpdate(std::shared_ptr<BPlusTreeNode> child, c
         }
     }
     propagateSeparatorUpdate(parent, old_sep, new_sep);
+}
+
+void BPlusTree::maybeSave() {
+    if (im) {
+        save();
+    }
+}
+
+void BPlusTree::save() {
+    if (!root) {
+        im->setRootNodeID(-1);
+        im->flush();
+        return;
+    }
+    saveRecursive(root);
+    im->setRootNodeID(root->node_id);
+    im->flush();
+}
+
+void BPlusTree::saveRecursive(std::shared_ptr<BPlusTreeNode> node) {
+    if (!node) return;
+    if (node->node_id == -1) {
+        node->node_id = im->allocateNodeID();
+    }
+    if (!node->is_leaf) {
+        for (auto& child : node->children) {
+            saveRecursive(child);
+        }
+    }
+    im->saveNode(node);
+}
+
+std::shared_ptr<BPlusTreeNode> BPlusTree::loadRecursive(int node_id) {
+    auto node = im->loadNode(node_id);
+    if (!node->is_leaf) {
+        for (auto& child : node->children) {
+            if (child && child->node_id != -1) {
+                auto loaded_child = loadRecursive(child->node_id);
+                loaded_child->parent = node;
+                child = loaded_child;
+            }
+        }
+    }
+    return node;
+}
+
+void BPlusTree::collectLeavesInOrder(std::shared_ptr<BPlusTreeNode> node,
+                                     std::vector<std::shared_ptr<BPlusTreeNode>>& leaves) {
+    if (!node) return;
+    if (node->is_leaf) {
+        leaves.push_back(node);
+    } else {
+        for (auto& child : node->children) {
+            collectLeavesInOrder(child, leaves);
+        }
+    }
+}
+
+void BPlusTree::load() {
+    int root_id = im->getRootNodeID();
+    if (root_id < 0) {
+        root = std::make_shared<BPlusTreeNode>(true);
+        return;
+    }
+    root = loadRecursive(root_id);
+
+    // Reconstruct next_leaf chain
+    std::vector<std::shared_ptr<BPlusTreeNode>> leaves;
+    collectLeavesInOrder(root, leaves);
+    for (size_t i = 0; i + 1 < leaves.size(); ++i) {
+        leaves[i]->next_leaf = leaves[i + 1];
+    }
+    if (!leaves.empty()) {
+        leaves.back()->next_leaf = nullptr;
+    }
 }

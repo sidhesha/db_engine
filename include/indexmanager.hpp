@@ -14,11 +14,17 @@ public:
     int allocateNodeID();
     void flush();
 
+    bool hasData() const;
+    void setRootNodeID(int id);
+    int getRootNodeID() const;
+
 private:
     std::fstream index_file;
     std::string filename;
     int next_node_id;
+    int root_node_id;
 
     void openFile();
     void ensureFileSize(std::size_t size);
+    std::size_t nodeOffset(int node_id) const;
 };

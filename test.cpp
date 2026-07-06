@@ -6,6 +6,7 @@
 #include "page.hpp"
 #include "node.hpp"
 #include "bplustree.hpp"
+#include "indexmanager.hpp"
 #include "catalogmanager.hpp"
 #include "pagemanager.hpp"
 #include "recordmanager.hpp"
@@ -516,6 +517,121 @@ static void test_table_insert_mismatch() {
     std::remove(file.c_str());
 }
 
+// ─── BPlusTree Persistence ───────────────────────────────────────────────────
+
+static void test_bpt_persist_20() {
+    const std::string file = "bt_20.db";
+    std::remove(file.c_str());
+    {
+        TEST("insert 20 keys and persist") {
+            IndexManager im(file);
+            BPlusTree t(im);
+            for (int i = 0; i < 20; i++) {
+                t.insert(Key(std::to_string(i)), i, i * 10);
+            }
+        } END_TEST;
+    }
+    {
+        TEST("reload and verify all 20 keys survive") {
+            IndexManager im(file);
+            BPlusTree t(im);
+            for (int i = 0; i < 20; i++) {
+                auto r = t.search(Key(std::to_string(i)));
+                assert(r.has_value());
+                assert(r->page_id == i);
+                assert(r->slot_id == i * 10);
+            }
+        } END_TEST;
+    }
+    {
+        TEST("reload and range scan") {
+            IndexManager im(file);
+            BPlusTree t(im);
+            auto results = t.rangeScan(Key("5"), Key("9"));
+            assert(results.size() == 5);
+        } END_TEST;
+    }
+    {
+        TEST("reload and getAll") {
+            IndexManager im(file);
+            BPlusTree t(im);
+            assert(t.getAllKeyRIDPairs().size() == 20);
+        } END_TEST;
+    }
+    std::remove(file.c_str());
+}
+
+static void test_bpt_persist_update() {
+    const std::string file = "bt_update.db";
+    std::remove(file.c_str());
+    {
+        TEST("insert, update, persist") {
+            IndexManager im(file);
+            BPlusTree t(im);
+            t.insert(Key("x"), 1, 1);
+            t.insert(Key("y"), 2, 2);
+            assert(t.update(Key("x"), 99, 99));
+        } END_TEST;
+    }
+    {
+        TEST("reload and verify update survived") {
+            IndexManager im(file);
+            BPlusTree t(im);
+            auto r = t.search(Key("x"));
+            assert(r.has_value());
+            assert(r->page_id == 99);
+            assert(r->slot_id == 99);
+            assert(t.search(Key("y"))->page_id == 2);
+        } END_TEST;
+    }
+    std::remove(file.c_str());
+}
+
+static void test_bpt_persist_remove() {
+    const std::string file = "bt_remove.db";
+    std::remove(file.c_str());
+    {
+        TEST("insert, remove, persist") {
+            IndexManager im(file);
+            BPlusTree t(im);
+            t.insert(Key("keep"), 0, 0);
+            t.insert(Key("gone"), 1, 1);
+            assert(t.remove(Key("gone")));
+        } END_TEST;
+    }
+    {
+        TEST("reload and verify remove survived") {
+            IndexManager im(file);
+            BPlusTree t(im);
+            assert(t.search(Key("keep")).has_value());
+            assert(!t.search(Key("gone")).has_value());
+        } END_TEST;
+    }
+    std::remove(file.c_str());
+}
+
+static void test_bpt_persist_empty() {
+    const std::string file = "bt_empty.db";
+    std::remove(file.c_str());
+    {
+        TEST("save empty tree") {
+            IndexManager im(file);
+            BPlusTree t(im);
+            t.insert(Key("a"), 0, 0);
+            t.remove(Key("a"));
+        } END_TEST;
+    }
+    {
+        TEST("reload empty tree") {
+            IndexManager im(file);
+            BPlusTree t(im);
+            assert(!t.search(Key("a")).has_value());
+            assert(t.getAllKeyRIDPairs().empty());
+        } END_TEST;
+    }
+    std::remove(file.c_str());
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -531,6 +647,9 @@ int main() {
     test_pm_alloc(); test_pm_readback(); test_pm_multi();
     std::cout << "=== RecordManager ===\n";
     test_rm_basic(); test_rm_multi();
+    std::cout << "=== BPlusTree Persistence ===\n";
+    test_bpt_persist_20(); test_bpt_persist_update(); test_bpt_persist_remove(); test_bpt_persist_empty();
+
     std::cout << "=== Table ===\n";
     test_table_basic(); test_table_delete(); test_table_insert_mismatch();
 

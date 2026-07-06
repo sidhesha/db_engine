@@ -1,12 +1,14 @@
 #pragma once
 
 #include "node.hpp"
+#include "indexmanager.hpp"
 #include <memory>
 
 
 class BPlusTree {
 public:
     BPlusTree();
+    explicit BPlusTree(IndexManager& im);
 
     void insert(const Key& key, int page_id, int slot_id);
     void printTree() const;
@@ -15,8 +17,19 @@ public:
     std::vector<std::pair<Key, RID>> rangeScan(const Key& low, const Key& high);
     std::vector<std::pair<Key, RID>> getAllKeyRIDPairs() const;
     bool remove(const Key& key);
+
+    void save();
+    void load();
+
 private:
     std::shared_ptr<BPlusTreeNode> root;
+    IndexManager* im;
+
+    void maybeSave();
+    void saveRecursive(std::shared_ptr<BPlusTreeNode> node);
+    std::shared_ptr<BPlusTreeNode> loadRecursive(int node_id);
+    void collectLeavesInOrder(std::shared_ptr<BPlusTreeNode> node,
+                              std::vector<std::shared_ptr<BPlusTreeNode>>& leaves);
 
     void propagateSeparatorUpdate(std::shared_ptr<BPlusTreeNode> child, const Key& old_sep, const Key& new_sep);
 
