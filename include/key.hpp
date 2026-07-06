@@ -65,7 +65,9 @@ private:
         }
 
         if (std::holds_alternative<int>(value)) {
-            return std::get<int>(value) - std::get<int>(other.value);
+            int a = std::get<int>(value);
+            int b = std::get<int>(other.value);
+            return (a > b) - (a < b);
         }
 
         if (std::holds_alternative<float>(value)) {

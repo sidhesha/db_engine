@@ -11,6 +11,7 @@ BPlusTree::BPlusTree() {
 }
 
 std::shared_ptr<BPlusTreeNode> BPlusTree::findLeafNode(const Key& key) {
+    if (!root) return nullptr;
     auto current = root;
     while (!current->is_leaf) {
         int i = 0;
@@ -85,17 +86,20 @@ void BPlusTree::insertInternal(const Key& key,
 
 std::optional<RID> BPlusTree::search(const Key& key) {
     auto leaf = findLeafNode(key);
+    if (!leaf) return std::nullopt;
     return leaf->findInLeaf(key);
 }
 
 bool BPlusTree::update(const Key& key, int new_page_id, int new_slot_id) {
     auto leaf = findLeafNode(key);
+    if (!leaf) return false;
     return leaf->updateInLeaf(key, new_page_id, new_slot_id);
 }
 
 std::vector<std::pair<Key, RID>> 
 BPlusTree::rangeScan(const Key& low, const Key& high) {
     std::vector<std::pair<Key, RID>> results;
+    if (!root) return results;
     auto leaf = findLeafNode(low);
 
     while (leaf) {
@@ -171,6 +175,7 @@ void BPlusTree::printTree() const {
 
 std::vector<std::pair<Key, RID>> BPlusTree::getAllKeyRIDPairs() const {
     std::vector<std::pair<Key, RID>> results;
+    if (!root) return results;
     auto current = root;
     
     // Navigate to the leftmost leaf
@@ -193,6 +198,7 @@ std::vector<std::pair<Key, RID>> BPlusTree::getAllKeyRIDPairs() const {
 
 bool BPlusTree::remove(const Key& key) {
     auto leaf = findLeafNode(key);
+    if (!leaf) return false;
     auto it = std::find(leaf->keys.begin(), leaf->keys.end(), key);
     if (it == leaf->keys.end()) return false;
 
