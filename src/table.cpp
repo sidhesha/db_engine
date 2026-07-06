@@ -9,11 +9,13 @@ Table::Table(const std::string& name,
 
 
 RID Table::insert(const std::vector<std::string>& values) {
+    if (values.empty()) {
+        throw std::runtime_error("No values provided for insert.");
+    }
     if (values.size() != schema.getColumns().size()) {
         throw std::runtime_error("Mismatched column count in insert.");
     }
 
-    // Create a Record object from values
     Record record(values);
 
     // Delegate to RecordManager
