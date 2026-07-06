@@ -2,6 +2,7 @@
 
 ## Guiding principle
 Each phase builds on the previous. Every phase is independently demo-able in an interview.
+No shortcuts — each concept mirrors how a real database (PostgreSQL/InnoDB) works under the hood.
 
 ---
 
@@ -22,7 +23,7 @@ Each phase builds on the previous. Every phase is independently demo-able in an 
 ---
 
 ## Phase 2: Buffer Pool (≈ 3-4 sessions)
-**What:** Replace the current `PageManager` (read/write every call) with a fixed-size page cache using clock-sweep or LRU.
+**What:** Replace the current `PageManager` (read/write every call) with a fixed-size page cache using clock-sweep.
 **Why:** The #1 performance problem. Every `readPage`/`writePage` hits disk.
 
 **Plan:**
@@ -38,37 +39,56 @@ Each phase builds on the previous. Every phase is independently demo-able in an 
 
 ---
 
-## Phase 3: Write-Ahead Log (≈ 3-4 sessions)
+## Phase 3: B-Tree Concurrency — Latch Crabbing + B-Link (≈ 3-4 sessions)
+**What:** Allow concurrent reads and writes on the B+ tree without corruption.
+**Why:** The current tree is single-threaded. Real databases handle thousands of concurrent index operations.
+
+**Plan:**
+- Latch crabbing (lock-coupling): acquire latch on parent, then child, release parent — traverse safely
+- Replace `std::shared_ptr` children with stable page IDs so structural changes don't invalidate in-progress traversals
+- B-link variant: each internal node stores a "high key" and a link to a right sibling, so splits don't block readers
+- S/X latches on nodes (not std::mutex — spinlock or futex-based for low overhead)
+- Test: 4 threads hammering inserts + lookups simultaneously; no lost keys, no crashes
+
+**Systems concept taught:** Latches vs. locks, deadlock-free lacing, optimistic vs. pessimistic concurrency, B-link invariants.
+
+---
+
+## Phase 4: Write-Ahead Log (≈ 3-4 sessions)
 **What:** Before modifying any page, append a log record. On crash recovery, replay committed changes and undo uncommitted ones.
 **Why:** Durability. Without it, a crash mid-write corrupts the database.
 
 **Plan:**
-- Log format: `LSN | prev_LSN | txn_id | page_id | offset | old_data | new_data` (or simpler: `page_id | before_image | after_image`)
-- `WALWriter` — append-only sequential file
+- Log format: `LSN | prev_LSN | txn_id | page_id | offset | old_data | new_data`
+- `WALWriter` — append-only sequential file with LSN tracking
 - Every `BufferPool::unpinPage(dirty=true)` forces a log write first (WAL rule: write-ahead)
 - Recovery: read log forward; redo all changes; undo incomplete txns by writing before-images
 - Test: write records, corrupt the DB file (simulate crash), restart, assert data is intact
 
-**Systems concept taught:** ARIES fundamentals, REDO/UNDO, crash recovery, the write-ahead invariant.
+**Systems concept taught:** ARIES fundamentals, REDO/UNDO, crash recovery, the write-ahead invariant, LSN-based page tracking.
 
 ---
 
-## Phase 4: Simple Transactions (≈ 2-3 sessions)
-**What:** `BEGIN`, `COMMIT`, `ROLLBACK` with row-level locking.
-**Why:** Concurrency control — the other half of ACID.
+## Phase 5: MVCC Transactions (≈ 4-5 sessions)
+**What:** Multi-version concurrency control with undo logs — readers never block writers.
+**Why:** Basic 2PL is obsolete. PostgreSQL, InnoDB, and Oracle all use MVCC. It's the industry standard.
 
 **Plan:**
-- `Transaction` class: `txn_id`, `state` (ACTIVE/COMMITTED/ABORTED), `lock_set`
-- Lock manager: shared (read) / exclusive (write) locks on RIDs
-- Deadlock detection: timeout or waits-for graph
-- On `ROLLBACK`: apply UNDO using the WAL
-- Test: two threads inserting simultaneously; no lost updates, no dirty reads
+- `Transaction` class: `txn_id`, `state` (ACTIVE/COMMITTED/ABORTED), `snapshot`
+- Undo log: append-only chain of before-images per transaction
+- Each page header stores a `last_LSN` to coordinate with WAL
+- Row-level visibility: each record carries `create_txn_id` / `delete_txn_id`
+- Snapshot isolation: a transaction sees rows committed before its start timestamp
+- Lock manager for serializable conflicts (still needed for predicate locking)
+- Deadlock detection: waits-for graph with timeout
+- On `ROLLBACK`: walk the undo log, restore before-images
+- Test: multiple threads reading/writing concurrently; phantom-free snapshots
 
-**Systems concept taught:** Isolation levels, 2PL, deadlock, serializability.
+**Systems concept taught:** Snapshot isolation, visibility rules, undo logging, the read-set/write-set problem, true ACID compliance.
 
 ---
 
-## Phase 5: SQL Frontend (≈ 4-5 sessions)
+## Phase 6: SQL Frontend (≈ 4-5 sessions)
 **What:** Accept SQL over TCP and execute it.
 **Why:** This is the "oh you built a database" moment.
 
@@ -79,11 +99,11 @@ Each phase builds on the previous. Every phase is independently demo-able in an 
 - Wire protocol: simple `\n`-delimited text over TCP (no need for PostgreSQL wire protocol)
 - Single-threaded at first, then add connection pool
 
-**Systems concept taught:** Parsing, query planning, iterator model (next time), client-server architecture.
+**Systems concept taught:** Parsing, query planning, iterator model, client-server architecture.
 
 ---
 
-## Phase 6: Benchmarking & Polish (ongoing)
+## Phase 7: Benchmarking & Polish (ongoing)
 **What:** Measure and optimize.
 **Why:** Numbers on a resume.
 
@@ -91,6 +111,7 @@ Each phase builds on the previous. Every phase is independently demo-able in an 
 - Insert throughput (rows/s), point lookup latency, range scan speed
 - YCSB-style workload A (50% read / 50% update)
 - Compare: no buffer pool vs. buffer pool → shows your cache works
+- Compare: single-threaded vs. B-link concurrent → shows your latching works
 - fuzz testing: random operations, assert no crash
 
 ---
@@ -100,10 +121,11 @@ Each phase builds on the previous. Every phase is independently demo-able in an 
 | Phase | You can say |
 |-------|-------------|
 | 1 | "I serialized a B+ tree to disk so indexes survive crashes" |
-| 2 | "I built an LRU buffer pool to cache pages and reduce disk I/O by 100x" |
-| 3 | "I implemented a write-ahead log with crash recovery" |
-| 4 | "I added transactions with row-level locking and deadlock detection" |
-| 5 | "I wrote a SQL parser and a TCP server so clients can query the database" |
+| 2 | "I built a clock-sweep buffer pool that caches pages and reduces disk I/O by ~100x" |
+| 3 | "I added concurrent B-tree access with latch crabbing and B-link, so the tree is safe under 4+ threads" |
+| 4 | "I implemented a write-ahead log with ARIES-style crash recovery" |
+| 5 | "I built MVCC with undo logs — readers never block writers, exactly like PostgreSQL/InnoDB" |
+| 6 | "I wrote a SQL parser and a TCP server so clients can query the database" |
 
 Each phase builds a sentence you can say in an interview. No fluff.
 
@@ -115,7 +137,8 @@ Each phase builds a sentence you can say in an interview. No fluff.
 |-------|--------|
 | 1 — Persist the B+ Tree | ✅ Done |
 | 2 — Buffer Pool | 🔜 Next |
-| 3 — Write-Ahead Log | ⏳ |
-| 4 — Simple Transactions | ⏳ |
-| 5 — SQL Frontend | ⏳ |
-| 6 — Benchmarking & Polish | ⏳ |
+| 3 — B-Tree Concurrency (Latch Crabbing + B-link) | ⏳ |
+| 4 — Write-Ahead Log | ⏳ |
+| 5 — MVCC Transactions | ⏳ |
+| 6 — SQL Frontend | ⏳ |
+| 7 — Benchmarking & Polish | ⏳ |
