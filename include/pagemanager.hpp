@@ -1,7 +1,7 @@
 #pragma once
 
 #include "page.hpp"
-#include <fstream>
+#include "bufferpool.hpp"
 #include <string>
 
 class PageManager {
@@ -16,9 +16,5 @@ public:
     void flush();
 
 private:
-    std::fstream file;
-    std::string filename;
-    int next_page_id;
-
-    void openFile();
+    BufferPool buffer_pool;
 };

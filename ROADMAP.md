@@ -22,18 +22,19 @@ No shortcuts — each concept mirrors how a real database (PostgreSQL/InnoDB) wo
 
 ---
 
-## Phase 2: Buffer Pool (≈ 3-4 sessions)
+## ✅ Phase 2: Buffer Pool (COMPLETE)
 **What:** Replace the current `PageManager` (read/write every call) with a fixed-size page cache using clock-sweep.
 **Why:** The #1 performance problem. Every `readPage`/`writePage` hits disk.
 
-**Plan:**
-- `BufferPool` class owns N frames (e.g., 64 frames × 4 KB = 256 KB cache)
-- Each frame: `Page` + `page_id` + `dirty_flag` + `pin_count` + `last_access`
+**Done:**
+- `BufferPool` class owns 64 frames × 4 KB = 256 KB cache
+- Each frame: `Page` + `page_id` + `dirty_flag` + `pin_count` + `ref_bit`
 - `fetchPage(page_id)` — return from cache or read from disk; pin it
-- `unpinPage(page_id, dirty)` — release pin; if dirty, mark for eventual write
-- Eviction policy: Clock sweep (simpler than LRU, still shows you understand)
+- `unpinPage(page_id, dirty)` — release pin; if dirty, mark for writeback
+- Eviction policy: Clock sweep with ref_bit (second-chance algorithm)
 - `flush()` — write all dirty pages back to disk
-- Refactor `PageManager` to use `BufferPool` underneath (or replace it entirely)
+- `PageManager` refactored to use `BufferPool` underneath (transparent to callers)
+- 5 tests cover: fetch/unpin cycle, write+readback, eviction pressure (100 pages in 64 frames), dirty flush+reopen, sequential IDs
 
 **Systems concept taught:** Locality of reference, caching, the pin/unpin contract, eviction policy trade-offs.
 
@@ -112,6 +113,7 @@ No shortcuts — each concept mirrors how a real database (PostgreSQL/InnoDB) wo
 - YCSB-style workload A (50% read / 50% update)
 - Compare: no buffer pool vs. buffer pool → shows your cache works
 - Compare: single-threaded vs. B-link concurrent → shows your latching works
+- **Eviction policy shootout: clock-sweep vs. LRU-2** — implement a pluggable `EvictionPolicy` interface so both policies can be swapped at runtime. LRU-2 tracks the 2nd-most-recent access time per page to prevent scan pollution (a single range scan won't evict hot internal nodes).
 - fuzz testing: random operations, assert no crash
 
 ---
@@ -136,8 +138,8 @@ Each phase builds a sentence you can say in an interview. No fluff.
 | Phase | Status |
 |-------|--------|
 | 1 — Persist the B+ Tree | ✅ Done |
-| 2 — Buffer Pool | 🔜 Next |
-| 3 — B-Tree Concurrency (Latch Crabbing + B-link) | ⏳ |
+| 2 — Buffer Pool | ✅ Done |
+| 3 — B-Tree Concurrency (Latch Crabbing + B-link) | 🔜 Next |
 | 4 — Write-Ahead Log | ⏳ |
 | 5 — MVCC Transactions | ⏳ |
 | 6 — SQL Frontend | ⏳ |
