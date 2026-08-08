@@ -94,12 +94,29 @@ void IndexManager::saveNode(const std::shared_ptr<BPlusTreeNode>& node) {
 
 std::shared_ptr<BPlusTreeNode> IndexManager::loadNode(int node_id) {
     std::size_t offset = nodeOffset(node_id);
-    ensureFileSize(offset + PAGE_SIZE);
+
+    // Don't grow the file here: unlike saveNode(), a load must never
+    // silently manufacture data for a node_id that was never saved.
+    // Reading past the end would return a zero-filled page that
+    // deserializes into a bogus-but-valid-looking empty node instead of
+    // surfacing the corruption/bug loudly.
+    index_file.seekg(0, std::ios::end);
+    std::size_t file_size = index_file.tellg();
+    if (file_size < offset + PAGE_SIZE) {
+        throw std::runtime_error(
+            "IndexManager::loadNode: node_id " + std::to_string(node_id) +
+            " was never saved (index file too small)");
+    }
 
     index_file.seekg(offset, std::ios::beg);
 
     std::vector<char> buffer(PAGE_SIZE);
     index_file.read(buffer.data(), PAGE_SIZE);
+    if (!index_file) {
+        index_file.clear();
+        throw std::runtime_error(
+            "IndexManager::loadNode: failed to read node " + std::to_string(node_id));
+    }
 
     auto node = std::make_shared<BPlusTreeNode>();
     *node = BPlusTreeNode::deserialize(buffer);
