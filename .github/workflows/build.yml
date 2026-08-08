@@ -17,7 +17,7 @@ jobs:
           install: >-
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-cmake
-            mingw-w64-ucrt-x86_64-make
+            make
       - name: Configure
         run: cmake -S . -B build -G "MSYS Makefiles"
       - name: Build
