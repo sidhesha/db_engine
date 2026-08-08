@@ -19,7 +19,7 @@ jobs:
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-make
       - name: Configure
-        run: cmake -S . -B build -G "MSYS Makefiles"
+        run: cmake -S . -B build -G "MinGW Makefiles"
       - name: Build
         run: cmake --build build
       - name: Test
