@@ -28,12 +28,20 @@ std::vector<char> BPlusTreeNode::serialize() const {
     std::vector<char> buffer(PAGE_SIZE, 0); // fixed page size
     std::size_t offset = 0;
 
+    auto ensure_space = [&](std::size_t n) {
+        if (offset + n > PAGE_SIZE) {
+            throw std::runtime_error("BPlusTreeNode too large to fit in a page");
+        }
+    };
+
     auto write_int = [&](int value) {
+        ensure_space(sizeof(int));
         std::memcpy(buffer.data() + offset, &value, sizeof(int));
         offset += sizeof(int);
     };
 
     auto write_bool = [&](bool value) {
+        ensure_space(4);
         char b = value ? 1 : 0;
         std::memcpy(buffer.data() + offset, &b, sizeof(char));
         offset += 4; // align to 4 bytes
@@ -59,6 +67,7 @@ std::vector<char> BPlusTreeNode::serialize() const {
                 break;
             case KeyTypeTag::FLOAT: {
                 float f = std::get<float>(key.value);
+                ensure_space(sizeof(float));
                 std::memcpy(buffer.data() + offset, &f, sizeof(float));
                 offset += sizeof(float);
                 break;
@@ -67,6 +76,7 @@ std::vector<char> BPlusTreeNode::serialize() const {
                 std::string str = std::get<std::string>(key.value);
                 int len = static_cast<int>(str.size());
                 write_int(len);
+                ensure_space(static_cast<std::size_t>(len));
                 std::memcpy(buffer.data() + offset, str.data(), len);
                 offset += len;
                 break;
@@ -99,12 +109,20 @@ BPlusTreeNode BPlusTreeNode::deserialize(const std::vector<char>& data) {
 
     std::size_t offset = 0;
 
+    auto ensure_readable = [&](std::size_t n) {
+        if (offset + n > data.size()) {
+            throw std::runtime_error("Corrupt node: read past end of page");
+        }
+    };
+
     auto read_int = [&](int& value) {
+        ensure_readable(sizeof(int));
         std::memcpy(&value, data.data() + offset, sizeof(int));
         offset += sizeof(int);
     };
 
     auto read_bool = [&](bool& value) {
+        ensure_readable(4);
         char b;
         std::memcpy(&b, data.data() + offset, sizeof(char));
         offset += 4; // aligned
@@ -126,25 +144,35 @@ BPlusTreeNode BPlusTreeNode::deserialize(const std::vector<char>& data) {
         int type_tag;
         read_int(type_tag);
         switch (type_tag) {
-            case 0: // INTEGER
+            case 0: { // INTEGER
                 int int_val;
                 read_int(int_val);
                 key.value = int_val;
                 break;
-            case 1: // FLOAT
+            }
+            case 1: { // FLOAT
+                ensure_readable(sizeof(float));
                 float f;
                 std::memcpy(&f, data.data() + offset, sizeof(float));
                 offset += sizeof(float);
                 key.value = f;
                 break;
-            case 2: // STRING
+            }
+            case 2: { // STRING
                 int len;
                 read_int(len);
+                if (len < 0) {
+                    throw std::runtime_error("Corrupt node: negative string key length");
+                }
+                ensure_readable(static_cast<std::size_t>(len));
                 std::string str(len, '\0');
                 std::memcpy(str.data(), data.data() + offset, len);
                 offset += len;
                 key.value = str;
                 break;
+            }
+            default:
+                throw std::runtime_error("Corrupt node: unknown key type tag " + std::to_string(type_tag));
         }
         node.keys.push_back(key);
     }

@@ -1,5 +1,6 @@
 #include <iostream>
 #include <cassert>
+#include <cstring>
 #include "key.hpp"
 #include "schema.hpp"
 #include "record.hpp"
@@ -221,6 +222,56 @@ static void test_node() {
         a.insertInLeaf(Key("hello"),2,3); a.insertInLeaf(Key("world"),4,5);
         BPlusTreeNode b = BPlusTreeNode::deserialize(a.serialize());
         assert(b.node_id == 1 && b.keys.size() == 2);
+    } END_TEST;
+    TEST("deserialize throws cleanly on corrupt/unknown key type tag") {
+        // Hand-build a page: node_id=1, is_leaf=true, num_keys=1, then an
+        // invalid type_tag at the first key slot (offset 32). Must be
+        // rejected instead of reading garbage past the buffer.
+        std::vector<char> buf(PAGE_SIZE, 0);
+        int node_id = 1;
+        std::memcpy(buf.data() + 0, &node_id, sizeof(int));
+        char is_leaf = 1;
+        std::memcpy(buf.data() + 4, &is_leaf, 1);
+        int num_keys = 1;
+        std::memcpy(buf.data() + 8, &num_keys, sizeof(int));
+        int bogus_type_tag = 99;
+        std::memcpy(buf.data() + 32, &bogus_type_tag, sizeof(int));
+
+        bool caught = false;
+        try { BPlusTreeNode::deserialize(buf); }
+        catch (const std::runtime_error&) { caught = true; }
+        assert(caught);
+    } END_TEST;
+    TEST("deserialize throws cleanly on truncated string key length") {
+        // Same as above but type_tag=2 (STRING) with a length that claims
+        // more bytes than the page actually has.
+        std::vector<char> buf(PAGE_SIZE, 0);
+        int node_id = 1;
+        std::memcpy(buf.data() + 0, &node_id, sizeof(int));
+        char is_leaf = 1;
+        std::memcpy(buf.data() + 4, &is_leaf, 1);
+        int num_keys = 1;
+        std::memcpy(buf.data() + 8, &num_keys, sizeof(int));
+        int type_tag = 2; // STRING
+        std::memcpy(buf.data() + 32, &type_tag, sizeof(int));
+        int huge_len = PAGE_SIZE * 10;
+        std::memcpy(buf.data() + 36, &huge_len, sizeof(int));
+
+        bool caught = false;
+        try { BPlusTreeNode::deserialize(buf); }
+        catch (const std::runtime_error&) { caught = true; }
+        assert(caught);
+    } END_TEST;
+    TEST("serialize throws cleanly when a key can't fit in a page") {
+        // A string key long enough that header + type_tag + len + data
+        // exceeds PAGE_SIZE (4096) must be rejected with a clean error,
+        // not silently overrun the fixed-size serialize buffer.
+        BPlusTreeNode n(true);
+        std::string huge(PAGE_SIZE, 'x');
+        n.insertInLeaf(Key(huge), 0, 0);
+        bool caught = false;
+        try { n.serialize(); } catch (const std::runtime_error&) { caught = true; }
+        assert(caught);
     } END_TEST;
 }
 
@@ -633,6 +684,24 @@ static void test_bpt_persist_empty() {
     std::remove(file.c_str());
 }
 
+// ─── IndexManager ────────────────────────────────────────────────────────────
+
+static void test_indexmanager_load_unsaved_node() {
+    const std::string file = "im_unsaved.db";
+    std::remove(file.c_str());
+    TEST("loadNode throws on a node_id that was never saved") {
+        // A fresh IndexManager has never called saveNode/allocateNodeID, so
+        // node_id 5 does not exist on disk. loadNode() must fail loudly
+        // instead of silently zero-extending the file and returning a
+        // bogus-but-valid-looking empty node (masks real corruption/bugs).
+        IndexManager im(file);
+        bool caught = false;
+        try { im.loadNode(5); } catch (const std::runtime_error&) { caught = true; }
+        assert(caught);
+    } END_TEST;
+    std::remove(file.c_str());
+}
+
 // ─── BufferPool ──────────────────────────────────────────────────────────────
 
 static void test_bp_fetch_unpin() {
@@ -750,6 +819,8 @@ int main() {
     test_rm_basic(); test_rm_multi();
     std::cout << "=== BPlusTree Persistence ===\n";
     test_bpt_persist_20(); test_bpt_persist_update(); test_bpt_persist_remove(); test_bpt_persist_empty();
+    std::cout << "=== IndexManager ===\n";
+    test_indexmanager_load_unsaved_node();
 
     std::cout << "=== Table ===\n";
     test_table_basic(); test_table_delete(); test_table_insert_mismatch();
