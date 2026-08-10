@@ -4,8 +4,8 @@
 #include <cstring>
 #include <stdexcept>
 
-BufferPool::BufferPool(const std::string& fname)
-    : filename(fname), next_page_id(0), frames(NUM_FRAMES), clock_hand(0) {
+BufferPool::BufferPool(const std::string& fname, WALWriter& wal, TransactionManager& txns)
+    : filename(fname), next_page_id(0), wal(wal), txns(txns), frames(NUM_FRAMES), clock_hand(0) {
     openFile();
 
     std::filesystem::path path(filename);
@@ -50,6 +50,7 @@ Page& BufferPool::fetchPage(int page_id) {
     if (idx != -1) {
         frames[idx].pin_count++;
         frames[idx].ref_bit = true;
+        captureBeforeImage(idx);
         return *frames[idx].page;
     }
 
@@ -57,6 +58,7 @@ Page& BufferPool::fetchPage(int page_id) {
     readPageFromDisk(idx, page_id);
     frames[idx].pin_count = 1;
     frames[idx].ref_bit = true;
+    captureBeforeImage(idx);
     return *frames[idx].page;
 }
 
@@ -69,8 +71,39 @@ void BufferPool::unpinPage(int page_id, bool dirty) {
         frames[idx].pin_count--;
     }
     if (dirty) {
+        logUpdateIfChanged(idx, page_id);
         frames[idx].dirty = true;
     }
+}
+
+void BufferPool::captureBeforeImage(int idx) {
+    if (!frames[idx].before_image_valid) {
+        frames[idx].before_image = frames[idx].page->serialize();
+        frames[idx].before_image_valid = true;
+    }
+}
+
+void BufferPool::logUpdateIfChanged(int idx, int page_id) {
+    // Defensive: every fetchPage() captures a before-image, but guard
+    // against calling unpinPage(dirty=true) on a page that was never
+    // fetched through this BufferPool instance's normal path.
+    if (!frames[idx].before_image_valid) return;
+
+    std::vector<char> after_image = frames[idx].page->serialize();
+    if (after_image == frames[idx].before_image) {
+        // Caller marked it dirty but nothing actually changed -- nothing
+        // to log or redo.
+        frames[idx].before_image_valid = false;
+        return;
+    }
+
+    uint64_t txn_id = txns.begin();
+    uint64_t lsn = txns.appendRecord(txn_id, WALRecordType::UPDATE, WALStore::HEAP, page_id,
+                                      frames[idx].before_image, after_image);
+    txns.commit(txn_id);
+
+    frames[idx].page->setLSN(lsn);
+    frames[idx].before_image_valid = false;
 }
 
 int BufferPool::allocatePage() {
@@ -82,6 +115,12 @@ int BufferPool::allocatePage() {
     frames[idx].dirty = true;
     frames[idx].pin_count = 0;
     frames[idx].ref_bit = false;
+    // Snapshot the fresh empty page as the before-image: if the caller
+    // mutates it before write-back, unpinPage(dirty=true) can then log a
+    // real UPDATE (old = empty page, new = populated page), which is
+    // enough for redo to reconstruct it from nothing-on-disk.
+    frames[idx].before_image = frames[idx].page->serialize();
+    frames[idx].before_image_valid = true;
 
     return page_id;
 }
@@ -168,6 +207,11 @@ void BufferPool::readPageFromDisk(int frame_idx, int page_id) {
     frames[frame_idx].page = std::make_unique<Page>(Page::deserialize(buffer));
     frames[frame_idx].page_id = page_id;
     frames[frame_idx].dirty = false;
+    // This frame slot may previously have held a different page; the raw
+    // bytes just read are the correct fresh before-image for whatever
+    // page now occupies it.
+    frames[frame_idx].before_image = buffer;
+    frames[frame_idx].before_image_valid = true;
 }
 
 void BufferPool::writePageToDisk(int frame_idx) {
@@ -176,6 +220,10 @@ void BufferPool::writePageToDisk(int frame_idx) {
     std::vector<char> buffer = frames[frame_idx].page->serialize();
     std::size_t offset = static_cast<std::size_t>(frames[frame_idx].page_id) * PAGE_SIZE;
     ensureFileSize(offset + PAGE_SIZE);
+
+    // WAL rule: the log record covering this page's latest change must
+    // be durable before the page itself reaches disk.
+    wal.flushUpTo(frames[frame_idx].page->getLSN());
 
     file.seekp(offset, std::ios::beg);
     file.write(buffer.data(), PAGE_SIZE);

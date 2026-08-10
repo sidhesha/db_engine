@@ -6,10 +6,11 @@ Page::Page(uint32_t page_id): page_id(page_id), num_slots(0), free_space_offset(
     data.resize(PAGE_SIZE, 0);
 
     // memory for header
-    std::memcpy(&data[0], &page_id, sizeof(page_id)); 
+    std::memcpy(&data[0], &page_id, sizeof(page_id));
     std::memcpy(&data[4], &num_slots, sizeof(num_slots));
     std::memcpy(&data[6], &free_space_offset, sizeof(free_space_offset));
-    // std::cout << "page created with id:" << this->page_id << "\n"; 
+    std::memcpy(&data[8], &lsn, sizeof(lsn));
+    // std::cout << "page created with id:" << this->page_id << "\n";
 }
 
 
@@ -17,6 +18,7 @@ void Page::updateHeaderToData() {
     std::memcpy(&data[0], &page_id, sizeof(page_id));
     std::memcpy(&data[4], &num_slots, sizeof(num_slots));
     std::memcpy(&data[6], &free_space_offset, sizeof(free_space_offset));
+    std::memcpy(&data[8], &lsn, sizeof(lsn));
 }
 
 void Page::updateSlotDirectory() {
@@ -45,14 +47,17 @@ Page Page::deserialize(const std::vector<char> raw) {
 
     uint32_t page_id;
     uint16_t num_slots, free_space_offset;
+    uint64_t lsn;
 
     std::memcpy(&page_id, &raw[0], sizeof(page_id));
     std::memcpy(&num_slots, &raw[4], sizeof(num_slots));
     std::memcpy(&free_space_offset, &raw[6], sizeof(free_space_offset));
+    std::memcpy(&lsn, &raw[8], sizeof(lsn));
 
     Page page(page_id);
     page.num_slots = num_slots;
     page.free_space_offset = free_space_offset;
+    page.lsn = lsn;
 
     // Copy raw data buffer into page.data
     std::memcpy(page.data.data(), raw.data(), PAGE_SIZE);
@@ -143,4 +148,12 @@ int Page::getFreeSpace() const{
 }
 int Page::getNumSlots() const{
     return num_slots;
+}
+
+uint64_t Page::getLSN() const {
+    return lsn;
+}
+
+void Page::setLSN(uint64_t new_lsn) {
+    lsn = new_lsn;
 }

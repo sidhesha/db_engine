@@ -72,7 +72,6 @@ public:
     std::vector<std::pair<Key, RID>> getAllKeyRIDPairs() const;
     bool remove(const Key& key);
 
-    void save();
     void load();
 
 private:
@@ -127,8 +126,15 @@ private:
                         std::shared_ptr<BPlusTreeNode> right_child,
                         Key separator_key);
 
-    void maybeSave();
-    void saveRecursive(std::shared_ptr<BPlusTreeNode> node);
+    // Persists exactly the nodes this operation actually touched (see the
+    // thread_local dirty-set + markDirty() mechanism in bplustree.cpp),
+    // replacing the old "rewrite the whole tree every op" save(). Called
+    // once at the end of insert()/update()/remove(), after every latch
+    // this call held has been released (saveNode() itself doesn't latch,
+    // but WAL logging + IndexManager I/O has no business happening while
+    // holding tree latches). All of an operation's dirty nodes share one
+    // WAL transaction, so recovery undoes them as a single unit.
+    void saveDirty(const std::vector<std::shared_ptr<BPlusTreeNode>>& dirty);
     std::shared_ptr<BPlusTreeNode> loadRecursive(int node_id);
     void collectLeavesInOrder(std::shared_ptr<BPlusTreeNode> node,
                               std::vector<std::shared_ptr<BPlusTreeNode>>& leaves);

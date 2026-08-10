@@ -2,6 +2,7 @@
 #include <vector>
 #include <memory>
 #include <optional>
+#include <cstdint>
 #include "constants.hpp"
 #include "key.hpp"
 #include "latch.hpp"
@@ -12,6 +13,10 @@ class BPlusTreeNode {
 public:
     bool is_leaf;
     int node_id;
+    // ARIES page LSN for this node, mirroring Page::lsn (see page.hpp) --
+    // the LSN of the last WAL record applied to this node's on-disk
+    // slot, so redo can skip records already reflected on disk.
+    uint64_t lsn = 0;
     std::vector<Key> keys;
 
     // If leaf

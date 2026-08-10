@@ -7,6 +7,46 @@
 #include <stdexcept>
 #include <thread>
 
+namespace {
+
+// Which nodes the current thread's in-flight insert()/update()/remove()
+// call has actually mutated (created, split, merged into, had a key/rid/
+// child/separator change). Set up at the top of each of those calls and
+// torn down at the end, right around the point that used to call
+// maybeSave(). A thread_local pointer -- rather than threading a
+// DirtySet& parameter through propagateSplit/handleLeafUnderflow/
+// handleInternalUnderflow/propagateSeparatorUpdate -- so this bookkeeping
+// stays entirely additive: no signature changes, no new latch
+// acquisitions, nothing that could alter the latch-crabbing control flow
+// those functions already got right in Phase 3. Each top-level call runs
+// on one thread and never crosses threads, so thread_local scoping is
+// exactly right (and concurrent operations on the same tree, each on
+// their own thread, get their own independent dirty set).
+thread_local std::vector<std::shared_ptr<BPlusTreeNode>>* g_dirty_set = nullptr;
+
+void markDirty(const std::shared_ptr<BPlusTreeNode>& node) {
+    if (!g_dirty_set || !node) return;
+    for (auto& n : *g_dirty_set) {
+        if (n.get() == node.get()) return;  // already marked this operation
+    }
+    g_dirty_set->push_back(node);
+}
+
+// RAII scope for g_dirty_set: installs `dirty` as the active set for the
+// current thread's operation, restores the previous value (always
+// nullptr in practice, since these calls don't nest) on scope exit --
+// including via an exception, so a thrown error mid-operation can't leave
+// a stale pointer for the next call on this thread.
+struct DirtyScope {
+    std::vector<std::shared_ptr<BPlusTreeNode>>* previous;
+    explicit DirtyScope(std::vector<std::shared_ptr<BPlusTreeNode>>& dirty) : previous(g_dirty_set) {
+        g_dirty_set = &dirty;
+    }
+    ~DirtyScope() { g_dirty_set = previous; }
+};
+
+}  // namespace
+
 
 BPlusTree::BPlusTree()
     : im(nullptr) {
@@ -70,6 +110,9 @@ LatchHandle BPlusTree::tryAcquireSiblingExclusive(std::shared_ptr<BPlusTreeNode>
 }
 
 void BPlusTree::insert(const Key& key, int page_id, int slot_id) {
+    std::vector<std::shared_ptr<BPlusTreeNode>> dirty;
+    DirtyScope dirty_scope(dirty);
+
     // Shared for the whole descent (see class-level comment in
     // bplustree.hpp): excludes a concurrent structural change
     // (propagateSplit/remove()) from being mid-flight while this
@@ -104,6 +147,7 @@ void BPlusTree::insert(const Key& key, int page_id, int slot_id) {
     }
 
     current->insertInLeaf(key, page_id, slot_id);
+    markDirty(current.get());
 
     std::shared_ptr<BPlusTreeNode> split_left;
     std::shared_ptr<BPlusTreeNode> split_right;
@@ -119,6 +163,7 @@ void BPlusTree::insert(const Key& key, int page_id, int slot_id) {
         split_left = current.get();
         split_right = new_leaf;
         split_key = sk;
+        markDirty(split_right);  // brand-new node -- must be saved regardless
     }
 
     current.release();
@@ -128,7 +173,7 @@ void BPlusTree::insert(const Key& key, int page_id, int slot_id) {
         propagateSplit(ancestor_hints, split_left, split_right, split_key);
     }
 
-    maybeSave();
+    saveDirty(dirty);
 }
 
 void BPlusTree::propagateSplit(std::vector<std::shared_ptr<BPlusTreeNode>>& ancestor_hints,
@@ -183,6 +228,7 @@ void BPlusTree::propagateSplit(std::vector<std::shared_ptr<BPlusTreeNode>>& ance
                 new_root->children.push_back(right_child);
                 root = new_root;
                 root_guard.unlock();
+                markDirty(new_root);  // brand-new node -- must be saved regardless
                 setParent(left_child, new_root);
                 setParent(right_child, new_root);
                 return;
@@ -251,6 +297,7 @@ void BPlusTree::propagateSplit(std::vector<std::shared_ptr<BPlusTreeNode>>& ance
         parent->keys.insert(parent->keys.begin() + key_idx, separator_key);
         parent->children.insert(parent->children.begin() + key_idx + 1, right_child);
         setParent(right_child, parent.get());
+        markDirty(parent.get());
 
         if (!parent->isFull()) {
             return;
@@ -264,6 +311,7 @@ void BPlusTree::propagateSplit(std::vector<std::shared_ptr<BPlusTreeNode>>& ance
         new_internal->right_link = parent->right_link;
         parent->high_key = push_up_key;
         parent->right_link = new_internal;
+        markDirty(new_internal);  // brand-new node -- must be saved regardless
 
         left_child = parent.get();
         right_child = new_internal;
@@ -293,6 +341,9 @@ std::optional<RID> BPlusTree::search(const Key& key) {
 }
 
 bool BPlusTree::update(const Key& key, int new_page_id, int new_slot_id) {
+    std::vector<std::shared_ptr<BPlusTreeNode>> dirty;
+    DirtyScope dirty_scope(dirty);
+
     SharedLatchGuard structure_guard(structure_latch);
     auto root_snapshot = snapshotRoot();
     if (!root_snapshot) return false;
@@ -308,9 +359,11 @@ bool BPlusTree::update(const Key& key, int new_page_id, int new_slot_id) {
         current = std::move(child_handle);
         current = moveRight(std::move(current), key, true);
     }
+    auto node_ptr = current.get();
     bool ok = current->updateInLeaf(key, new_page_id, new_slot_id);
+    if (ok) markDirty(node_ptr);
     current.release();
-    if (ok) maybeSave();
+    if (ok) saveDirty(dirty);
     return ok;
 }
 
@@ -430,6 +483,9 @@ std::vector<std::pair<Key, RID>> BPlusTree::getAllKeyRIDPairs() const {
 
 
 bool BPlusTree::remove(const Key& key) {
+    std::vector<std::shared_ptr<BPlusTreeNode>> dirty;
+    DirtyScope dirty_scope(dirty);
+
     auto root_snapshot = snapshotRoot();
     if (!root_snapshot) return false;
 
@@ -469,6 +525,7 @@ bool BPlusTree::remove(const Key& key) {
     int idx = static_cast<int>(it - leaf->keys.begin());
     leaf->keys.erase(it);
     leaf->rids.erase(leaf->rids.begin() + idx);
+    markDirty(leaf);
 
     // If the deleted key was the first key, update parent separator
     if (idx == 0) {
@@ -487,7 +544,7 @@ bool BPlusTree::remove(const Key& key) {
         swapRoot(nullptr);
         path.clear();
         structure_lock.release();
-        maybeSave();
+        saveDirty(dirty);
         return true;
     }
 
@@ -497,15 +554,14 @@ bool BPlusTree::remove(const Key& key) {
     }
 
     // Release every latch this call still holds -- including
-    // structure_lock -- *before* triggering a save: save()/
-    // saveRecursive() re-latch nodes (including possibly ones still
-    // held here) and structure_latch itself (shared), so calling it
-    // while still holding any of our own locks is a guaranteed
-    // self-deadlock (same thread spinning to re-acquire something it
-    // already holds).
+    // structure_lock -- *before* triggering a save: saveDirty()/
+    // IndexManager::saveNode() do their own I/O (and WAL logging) and
+    // have no business happening while holding tree latches, and
+    // structure_latch itself (shared elsewhere) would self-deadlock if
+    // still held here.
     path.clear();
     structure_lock.release();
-    maybeSave();
+    saveDirty(dirty);
     return true;
 }
 
@@ -546,6 +602,7 @@ void BPlusTree::handleLeafUnderflow(std::vector<LatchHandle>& path) {
             left_sibling->rids.pop_back();
             parent->keys[index - 1] = node->keys.front();
             left_sibling->high_key = node->keys.front();
+            markDirty(node); markDirty(left_sibling.get()); markDirty(parent.get());
             return;
         }
     }
@@ -561,6 +618,7 @@ void BPlusTree::handleLeafUnderflow(std::vector<LatchHandle>& path) {
         right_sibling->rids.erase(right_sibling->rids.begin());
         parent->keys[index] = right_sibling->keys.front();
         node->high_key = right_sibling->keys.front();
+        markDirty(node); markDirty(right_sibling.get()); markDirty(parent.get());
         return;
     }
 
@@ -584,6 +642,7 @@ void BPlusTree::handleLeafUnderflow(std::vector<LatchHandle>& path) {
             parent->children.erase(parent->children.begin() + index);
             parent->keys.erase(parent->keys.begin() + index - 1);
             path.pop_back(); // release `node`: fully absorbed into left_sibling
+            markDirty(left_sibling.get()); markDirty(parent.get());
 
             if (path.size() == 1 && parent->keys.empty()) {
                 // We still hold left_sibling's own latch here, so set
@@ -621,6 +680,7 @@ void BPlusTree::handleLeafUnderflow(std::vector<LatchHandle>& path) {
         parent->children.erase(parent->children.begin() + index + 1);
         parent->keys.erase(parent->keys.begin() + index);
         right_sibling.release(); // fully absorbed into `node`; done with it
+        markDirty(node); markDirty(parent.get());
 
         if (path.size() == 2 && parent->keys.empty()) {
             // We still hold `node`'s own latch (it's path.back()), so
@@ -668,6 +728,7 @@ void BPlusTree::handleInternalUnderflow(std::vector<LatchHandle>& path) {
             node->children.insert(node->children.begin(), moved_child);
             setParent(moved_child, node);
             left_sibling->children.pop_back();
+            markDirty(node); markDirty(left_sibling.get()); markDirty(parent.get());
             return;
         }
     }
@@ -685,6 +746,7 @@ void BPlusTree::handleInternalUnderflow(std::vector<LatchHandle>& path) {
         node->children.push_back(moved_child);
         setParent(moved_child, node);
         right_sibling->children.erase(right_sibling->children.begin());
+        markDirty(node); markDirty(right_sibling.get()); markDirty(parent.get());
         return;
     }
 
@@ -707,6 +769,7 @@ void BPlusTree::handleInternalUnderflow(std::vector<LatchHandle>& path) {
             parent->keys.erase(parent->keys.begin() + index - 1);
             parent->children.erase(parent->children.begin() + index);
             path.pop_back(); // release `node`: fully absorbed into left_sibling
+            markDirty(left_sibling.get()); markDirty(parent.get());
 
             if (path.size() == 1 && parent->keys.empty()) {
                 // Still holding left_sibling's own latch: set its
@@ -745,6 +808,7 @@ void BPlusTree::handleInternalUnderflow(std::vector<LatchHandle>& path) {
         parent->keys.erase(parent->keys.begin() + index);
         parent->children.erase(parent->children.begin() + index + 1);
         right_sibling.release(); // fully absorbed into `node`; done with it
+        markDirty(node); markDirty(parent.get());
 
         if (path.size() == 2 && parent->keys.empty()) {
             // Still holding `node`'s own latch (it's path.back()): set
@@ -773,13 +837,15 @@ void BPlusTree::propagateSeparatorUpdate(std::vector<LatchHandle>& path, const K
         for (size_t i = 0; i < ancestor->keys.size(); ++i) {
             if (ancestor->keys[i] == old_sep) {
                 ancestor->keys[i] = new_sep;
+                markDirty(ancestor.get());
                 // Invariant: children[i]'s high_key mirrors this
                 // separator (same bookkeeping the borrow/merge cases
                 // below already do for their own parent/sibling pair).
                 // children[i] is the *left* sibling of wherever this
                 // call's path descended at this level -- descent always
                 // steps past keys[i] when key >= keys[i], so it's never
-                // something already held in `path`.
+                // something already held in `path`. high_key isn't
+                // persisted (see rebuildLinks()), so no markDirty here.
                 LatchHandle left_child(ancestor->children[i], true);
                 left_child->high_key = new_sep;
                 return;
@@ -788,43 +854,51 @@ void BPlusTree::propagateSeparatorUpdate(std::vector<LatchHandle>& path, const K
     }
 }
 
-void BPlusTree::maybeSave() {
-    if (im) {
-        save();
-    }
-}
-
-void BPlusTree::save() {
-    // Callers (insert()/remove()/update()) always release their own
-    // structure_latch hold before calling this (directly or via
-    // maybeSave()) -- see the comments at those release() call sites --
-    // so taking it here (shared: save() only reads/serializes, doesn't
-    // restructure) is safe, not a self-deadlock.
-    SharedLatchGuard structure_guard(structure_latch);
+void BPlusTree::saveDirty(const std::vector<std::shared_ptr<BPlusTreeNode>>& dirty) {
+    if (!im) return;
+    // Serializes IndexManager's actual file I/O across concurrent
+    // operations (its fstream isn't safe for concurrent use); not a
+    // structural lock; nothing to self-deadlock against. Unlike the old
+    // save(), this doesn't need structure_latch: that guarded a full
+    // recursive tree walk (node->children) against concurrent shape
+    // changes, and saveDirty() no longer walks anything -- `dirty` is
+    // already the fixed, concrete list of nodes this operation touched.
     std::lock_guard<std::mutex> io_lock(io_mutex);
-    auto root_snapshot = snapshotRoot();
-    if (!root_snapshot) {
-        im->setRootNodeID(-1);
-        im->flush();
-        return;
-    }
-    saveRecursive(root_snapshot);
-    im->setRootNodeID(root_snapshot->node_id);
-    im->flush();
-}
 
-void BPlusTree::saveRecursive(std::shared_ptr<BPlusTreeNode> node) {
-    if (!node) return;
-    LatchHandle guard(node, true);
-    if (node->node_id == -1) {
-        node->node_id = im->allocateNodeID();
-    }
-    if (!node->is_leaf) {
-        for (auto& child : node->children) {
-            saveRecursive(child);
+    if (!dirty.empty()) {
+        // Assign node_ids to brand-new nodes first, each under its own
+        // node's latch: a node can appear in two concurrent operations'
+        // dirty sets (e.g. one op mutates it, releases its latches, and
+        // a second op touches it again before the first op's saveDirty()
+        // runs), so the check-and-assign has to be race-free against
+        // another thread doing the same check-and-assign concurrently.
+        for (auto& node : dirty) {
+            LatchHandle guard(node, true);
+            if (node->node_id == -1) {
+                node->node_id = im->allocateNodeID();
+            }
         }
+
+        // All of this operation's node writes share one WAL transaction,
+        // so a crash mid-way through a multi-node structural change (a
+        // split cascade, a merge) undoes as a single unit rather than
+        // leaving some of the change applied and some not.
+        TransactionManager& txns = im->getTransactionManager();
+        uint64_t txn_id = txns.begin();
+        for (auto& node : dirty) {
+            // Shared: saveNode() only reads the node to serialize it.
+            // Protects against a concurrent operation mutating this same
+            // node's fields while we're reading them here (we hold none
+            // of our own operation's latches by this point).
+            LatchHandle guard(node, false);
+            im->saveNode(node, txn_id);
+        }
+        txns.commit(txn_id);
     }
-    im->saveNode(node);
+
+    auto root_snapshot = snapshotRoot();
+    im->setRootNodeID(root_snapshot ? root_snapshot->node_id : -1);
+    im->flush();
 }
 
 std::shared_ptr<BPlusTreeNode> BPlusTree::loadRecursive(int node_id) {
