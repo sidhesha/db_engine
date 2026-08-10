@@ -1,6 +1,10 @@
 #include <iostream>
 #include <cassert>
 #include <cstring>
+#include <thread>
+#include <atomic>
+#include <vector>
+#include <set>
 #include "key.hpp"
 #include "schema.hpp"
 #include "record.hpp"
@@ -799,6 +803,173 @@ static void test_bp_sequential_ids() {
     std::remove(file.c_str());
 }
 
+// ─── Concurrent BPlusTree (Phase 3: latch crabbing + B-link) ─────────────────
+// No ThreadSanitizer on this MinGW toolchain (-fsanitize=thread fails to
+// link), so these lean on volume + varied access patterns across many
+// threads/iterations rather than a sanitizer to surface races.
+
+static void test_concurrent_disjoint_inserts() {
+    TEST("concurrent: disjoint inserts from many threads all land") {
+        constexpr int NUM_THREADS = 8;
+        constexpr int KEYS_PER_THREAD = 200;
+        BPlusTree t;
+
+        std::vector<std::thread> threads;
+        for (int ti = 0; ti < NUM_THREADS; ++ti) {
+            threads.emplace_back([&t, ti]() {
+                for (int i = 0; i < KEYS_PER_THREAD; ++i) {
+                    int k = ti * KEYS_PER_THREAD + i;
+                    t.insert(Key(k), k, k * 10);
+                }
+            });
+        }
+        for (auto& th : threads) th.join();
+
+        for (int k = 0; k < NUM_THREADS * KEYS_PER_THREAD; ++k) {
+            auto r = t.search(Key(k));
+            if (!r.has_value() || r->page_id != k || r->slot_id != k * 10) {
+                std::cerr << "MISSING/WRONG key " << k << "\n";
+                assert(false);
+            }
+        }
+        auto all = t.getAllKeyRIDPairs();
+        assert(all.size() == static_cast<size_t>(NUM_THREADS * KEYS_PER_THREAD));
+        for (size_t i = 1; i < all.size(); ++i) {
+            assert(all[i - 1].first < all[i].first); // still sorted, no duplicates
+        }
+    } END_TEST;
+}
+
+static void test_concurrent_mixed_insert_search() {
+    TEST("concurrent: mixed insert + search, no crash, no wrong reads") {
+        constexpr int NUM_KEYS = 320; // divisible by 2*NUM_WRITER_THREADS so every key actually gets inserted
+        constexpr int NUM_WRITER_THREADS = 4;
+        constexpr int NUM_READER_THREADS = 4;
+        constexpr int SEARCHES_PER_READER = 500;
+        BPlusTree t;
+
+        // Seed some keys before the race so readers have something to find.
+        for (int i = 0; i < NUM_KEYS / 2; ++i) t.insert(Key(i), i, i);
+
+        std::atomic<bool> stop{false};
+        std::atomic<int> wrong_reads{0};
+        std::vector<std::thread> threads;
+
+        for (int ti = 0; ti < NUM_WRITER_THREADS; ++ti) {
+            threads.emplace_back([&t, ti]() {
+                for (int i = 0; i < NUM_KEYS / (2 * NUM_WRITER_THREADS); ++i) {
+                    int k = NUM_KEYS / 2 + ti * (NUM_KEYS / (2 * NUM_WRITER_THREADS)) + i;
+                    t.insert(Key(k), k, k);
+                }
+            });
+        }
+        for (int ti = 0; ti < NUM_READER_THREADS; ++ti) {
+            threads.emplace_back([&t, &wrong_reads]() {
+                for (int i = 0; i < SEARCHES_PER_READER; ++i) {
+                    int k = i % (NUM_KEYS / 2); // always an already-seeded key
+                    auto r = t.search(Key(k));
+                    if (!r.has_value() || r->page_id != k) {
+                        wrong_reads.fetch_add(1);
+                    }
+                }
+            });
+        }
+        for (auto& th : threads) th.join();
+
+        assert(wrong_reads.load() == 0);
+        for (int k = 0; k < NUM_KEYS; ++k) {
+            assert(t.search(Key(k)).has_value());
+        }
+    } END_TEST;
+}
+
+static void test_concurrent_rangescan_during_inserts() {
+    TEST("concurrent: rangeScan during inserts sees a consistent, sorted view") {
+        constexpr int NUM_KEYS = 400;
+        BPlusTree t;
+        for (int i = 0; i < NUM_KEYS; i += 2) t.insert(Key(i), i, i); // seed evens
+
+        std::atomic<bool> stop{false};
+        std::atomic<int> bad_scans{0};
+
+        std::thread writer([&t, &stop]() {
+            for (int i = 1; i < NUM_KEYS; i += 2) { // fill in odds
+                t.insert(Key(i), i, i);
+            }
+            stop.store(true);
+        });
+
+        std::thread reader([&t, &stop, &bad_scans]() {
+            while (!stop.load()) {
+                auto r = t.rangeScan(Key(0), Key(NUM_KEYS));
+                for (size_t i = 1; i < r.size(); ++i) {
+                    if (!(r[i - 1].first < r[i].first)) {
+                        bad_scans.fetch_add(1);
+                        break;
+                    }
+                }
+            }
+        });
+
+        writer.join();
+        reader.join();
+
+        assert(bad_scans.load() == 0);
+        auto final_scan = t.rangeScan(Key(0), Key(NUM_KEYS));
+        assert(final_scan.size() == static_cast<size_t>(NUM_KEYS));
+    } END_TEST;
+}
+
+static void test_concurrent_insert_remove() {
+    TEST("concurrent: inserts and removes on disjoint keys stay consistent") {
+        constexpr int NUM_INITIAL = 300;
+        constexpr int NUM_THREADS = 6; // 3 removers, 3 inserters
+        BPlusTree t;
+        for (int i = 0; i < NUM_INITIAL; ++i) t.insert(Key(i), i, i);
+
+        std::vector<std::thread> threads;
+        // Removers: each thread removes a disjoint slice of the initial keys.
+        int per_remover = NUM_INITIAL / 3;
+        for (int ti = 0; ti < 3; ++ti) {
+            threads.emplace_back([&t, ti, per_remover]() {
+                for (int i = 0; i < per_remover; ++i) {
+                    int k = ti * per_remover + i;
+                    t.remove(Key(k));
+                }
+            });
+        }
+        // Inserters: each thread inserts a disjoint slice of brand-new keys.
+        int per_inserter = 100;
+        for (int ti = 0; ti < 3; ++ti) {
+            threads.emplace_back([&t, ti, per_inserter]() {
+                for (int i = 0; i < per_inserter; ++i) {
+                    int k = NUM_INITIAL + 1000 + ti * per_inserter + i;
+                    t.insert(Key(k), k, k);
+                }
+            });
+        }
+        for (auto& th : threads) th.join();
+
+        for (int i = 0; i < 3 * per_remover; ++i) {
+            assert(!t.search(Key(i)).has_value());
+        }
+        for (int i = 3 * per_remover; i < NUM_INITIAL; ++i) {
+            assert(t.search(Key(i)).has_value());
+        }
+        for (int i = 0; i < 3 * per_inserter; ++i) {
+            int ti = i / per_inserter;
+            int local = i % per_inserter;
+            int k = NUM_INITIAL + 1000 + ti * per_inserter + local;
+            assert(t.search(Key(k)).has_value());
+        }
+
+        auto all = t.getAllKeyRIDPairs();
+        for (size_t i = 1; i < all.size(); ++i) {
+            assert(all[i - 1].first < all[i].first);
+        }
+    } END_TEST;
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -824,6 +995,12 @@ int main() {
 
     std::cout << "=== Table ===\n";
     test_table_basic(); test_table_delete(); test_table_insert_mismatch();
+
+    std::cout << "=== Concurrent BPlusTree (Phase 3) ===\n";
+    test_concurrent_disjoint_inserts();
+    test_concurrent_mixed_insert_search();
+    test_concurrent_rangescan_during_inserts();
+    test_concurrent_insert_remove();
 
     int total = passed + failed;
     std::cout << "\n=== " << passed << "/" << total << " passed";

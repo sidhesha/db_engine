@@ -40,16 +40,18 @@ No shortcuts — each concept mirrors how a real database (PostgreSQL/InnoDB) wo
 
 ---
 
-## Phase 3: B-Tree Concurrency — Latch Crabbing + B-Link (≈ 3-4 sessions)
+## ✅ Phase 3: B-Tree Concurrency — Latch Crabbing + B-Link (COMPLETE)
 **What:** Allow concurrent reads and writes on the B+ tree without corruption.
 **Why:** The current tree is single-threaded. Real databases handle thousands of concurrent index operations.
 
-**Plan:**
-- Latch crabbing (lock-coupling): acquire latch on parent, then child, release parent — traverse safely
-- Replace `std::shared_ptr` children with stable page IDs so structural changes don't invalidate in-progress traversals
-- B-link variant: each internal node stores a "high key" and a link to a right sibling, so splits don't block readers
-- S/X latches on nodes (not std::mutex — spinlock or futex-based for low overhead)
-- Test: 4 threads hammering inserts + lookups simultaneously; no lost keys, no crashes
+**Done:**
+- `RWSpinLatch`: custom atomic-based reader-writer spinlock (not `std::mutex`/`shared_mutex`) with shared/exclusive modes and a non-blocking `tryLock()`, one per `BPlusTreeNode`
+- Latch crabbing on every traversal (search/insert/remove/rangeScan): hand-over-hand, child latched before parent released
+- B-link design: every node carries a `high_key` and a right-sibling link; `moveRight()` lets a traversal step sideways past an in-progress split instead of blocking on it
+- A coarser `structure_latch` (also an `RWSpinLatch`) layered on top: shared for all traversals, exclusive for the full duration of any structural change (split fix-up, remove's borrow/merge) — this is what closes the AB-BA deadlock between a cascading merge's ancestor walk and a concurrent plain insert's descent
+- Deadlock avoidance for "backwards" (right-to-left) latch acquisitions (e.g. grabbing a *left* sibling during rebalancing) via conditional `tryLock` + bounded retry rather than a blocking acquire
+- Invariant enforced end-to-end: a node's `high_key` always mirrors the separator key one level up (`parent->keys[i] == parent->children[i]->high_key`) — every place a separator is rewritten (borrow, merge, `propagateSeparatorUpdate`) now updates the corresponding child's `high_key` in the same step; a missing update here was the root cause of a real, deterministically-reproducible bug where removes silently no-op'd on certain keys
+- Concurrency test suite: disjoint inserts across many threads, mixed insert+search, rangeScan during concurrent inserts, and concurrent insert+remove on disjoint key ranges — all validated for many repeated runs (not just once), since the bugs here were rare enough to hide across dozens of clean runs
 
 **Systems concept taught:** Latches vs. locks, deadlock-free lacing, optimistic vs. pessimistic concurrency, B-link invariants.
 
@@ -139,8 +141,8 @@ Each phase builds a sentence you can say in an interview. No fluff.
 |-------|--------|
 | 1 — Persist the B+ Tree | ✅ Done |
 | 2 — Buffer Pool | ✅ Done |
-| 3 — B-Tree Concurrency (Latch Crabbing + B-link) | 🔜 Next |
-| 4 — Write-Ahead Log | ⏳ |
+| 3 — B-Tree Concurrency (Latch Crabbing + B-link) | ✅ Done |
+| 4 — Write-Ahead Log | 🔜 Next |
 | 5 — MVCC Transactions | ⏳ |
 | 6 — SQL Frontend | ⏳ |
 | 7 — Benchmarking & Polish | ⏳ |

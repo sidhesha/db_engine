@@ -73,3 +73,9 @@ Uses `passed`/`failed` globals with try/catch. No test framework dependency.
 2. Write test in `test.cpp`, implement, run all tests
 3. Push, open PR using `.github/pull_request_template.md`
 4. Request review, merge after approval
+
+**Hard rule: never merge on red.** Write the failing test first (TDD), run
+the full local suite, and confirm the CI check on the PR is actually green
+before merging — no hacks or workarounds just to make a test "pass." A run
+of PRs got merged here with CI silently broken for 3 merges straight;
+verify the check ran and passed, don't assume.

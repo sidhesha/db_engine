@@ -282,9 +282,10 @@ std::pair<Key, std::shared_ptr<BPlusTreeNode>> BPlusTreeNode::splitInternalNode(
     keys.resize(mid);
     children.resize(mid + 1);
 
-    for (auto& child : new_node->children) {
-        if (child) child->parent = new_node;
-    }
+    // Moved children's parent pointers are NOT updated here: writing a
+    // node's `parent` field must happen while holding that node's own
+    // latch (see BPlusTree::setParent), and this class has no notion of
+    // latching. The caller (BPlusTree::propagateSplit) does it instead.
 
     return {push_up_key, new_node};
 }
