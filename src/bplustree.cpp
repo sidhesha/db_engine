@@ -233,13 +233,82 @@ void BPlusTree::propagateSplit(std::vector<std::shared_ptr<BPlusTreeNode>>& ance
                 setParent(right_child, new_root);
                 return;
             }
-            root_guard.unlock();
-            // Not the root: some sibling's parent fix-up simply hasn't
-            // completed yet (a very short critical section). Spin
-            // briefly until it shows up.
-            while (!parent_hint) {
-                std::this_thread::yield();
-                parent_hint = getParent(left_child);
+            // Not the root -- but if the root is *still a bare leaf*
+            // (never yet promoted to an internal node), no propagateSplit
+            // call has successfully fixed up any part of this chain, and
+            // -- critically -- none ever can while this thread holds
+            // structure_latch exclusively: fixing up a parent requires
+            // this exact lock. This isn't hypothetical: with the tree
+            // still a single leaf, every thread's first few inserts all
+            // land on that same leaf (nothing else to route to yet), so
+            // multiple threads can each independently split the frontier
+            // leaf before any of them gets exclusive access to promote
+            // the root. The exclusive lock has no ordering guarantee
+            // among waiting writers, so a "downstream" split (of a
+            // right-sibling created by an earlier split) can win that
+            // race and run before the "upstream" root promotion does --
+            // confirmed via gdb: a thread stuck here holding
+            // structure_latch while root itself sat unpromoted, verified
+            // by inspecting both threads' actual left_child/separator_key
+            // values under CPU-constrained concurrent-insert stress.
+            //
+            // Since this thread already holds the only lock that could
+            // ever fix this, do it here instead of waiting: walk root's
+            // leaf chain (next_leaf) from the front, collecting every
+            // leaf up to and including left_child (they form a
+            // contiguous prefix of the chain by construction -- each
+            // split only ever appends further right), and promote all of
+            // them under one new internal root in a single step.
+            // root->is_leaf and, below, each leaf's high_key/next_leaf
+            // were last written under that leaf's own per-node latch
+            // (by whichever thread split it) -- structure_latch being
+            // exclusive rules out concurrent *mutation* of them, but a
+            // brief latch on each node read here is what actually
+            // establishes the acquire/release pairing needed to see
+            // those writes correctly, same defensive reasoning as the
+            // left_child read above (see its comment).
+            bool root_is_leaf;
+            {
+                LatchHandle g(root, false);
+                root_is_leaf = root->is_leaf;
+            }
+            if (root_is_leaf) {
+                auto new_root = std::make_shared<BPlusTreeNode>(false);
+                auto leaf = root;
+                bool found = false;
+                while (leaf) {
+                    new_root->children.push_back(leaf);
+                    if (leaf.get() == left_child.get()) {
+                        found = true;
+                        break;
+                    }
+                    std::optional<Key> hk;
+                    std::shared_ptr<BPlusTreeNode> next;
+                    {
+                        LatchHandle g(leaf, false);
+                        hk = leaf->high_key;
+                        next = leaf->next_leaf;
+                    }
+                    if (!hk.has_value()) break;  // chain ends before reaching left_child
+                    new_root->keys.push_back(*hk);
+                    leaf = next;
+                }
+                if (!found) {
+                    root_guard.unlock();
+                    throw std::runtime_error(
+                        "propagateSplit: left_child not reachable via root's leaf chain -- tree structure corrupted");
+                }
+                root = new_root;
+                root_guard.unlock();
+                markDirty(new_root);  // brand-new node -- must be saved regardless
+                for (auto& child : new_root->children) {
+                    setParent(child, new_root);
+                }
+                parent_hint = new_root;
+            } else {
+                root_guard.unlock();
+                throw std::runtime_error(
+                    "propagateSplit: left_child has no parent, isn't root, and root is already internal -- tree structure corrupted");
             }
         }
 
