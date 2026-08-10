@@ -34,3 +34,9 @@ All tests live in a single `test.cpp` file. Each test function is a simple funct
 3. Push branch and open PR using the PR template
 4. Request review
 5. After approval, merge via PR
+
+**Hard rule: never merge on red.** Write the failing test first (TDD, above),
+run the full local suite, and confirm the CI check on the PR is actually
+green before merging — no hacks or workarounds just to make a test "pass."
+A run of PRs got merged here with CI silently broken for 3 merges straight;
+verify the check ran and passed, don't assume.
