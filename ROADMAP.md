@@ -57,16 +57,21 @@ No shortcuts — each concept mirrors how a real database (PostgreSQL/InnoDB) wo
 
 ---
 
-## Phase 4: Write-Ahead Log (≈ 3-4 sessions)
+## ✅ Phase 4: Write-Ahead Log (COMPLETE)
 **What:** Before modifying any page, append a log record. On crash recovery, replay committed changes and undo uncommitted ones.
 **Why:** Durability. Without it, a crash mid-write corrupts the database.
 
-**Plan:**
-- Log format: `LSN | prev_LSN | txn_id | page_id | offset | old_data | new_data`
-- `WALWriter` — append-only sequential file with LSN tracking
-- Every `BufferPool::unpinPage(dirty=true)` forces a log write first (WAL rule: write-ahead)
-- Recovery: read log forward; redo all changes; undo incomplete txns by writing before-images
-- Test: write records, corrupt the DB file (simulate crash), restart, assert data is intact
+**Done:**
+- Found and fixed a prerequisite gap before any of this could work: `IndexManager` had no incremental writes at all -- `BPlusTree::save()` unconditionally re-serialized and rewrote *every* node in the tree on every single `insert`/`update`/`remove`. A page-granular WAL can't log a meaningful diff for a write that touches everything, so this had to become real incremental persistence first (see below) -- otherwise the WAL would only have protected the heap, not the index.
+- `Page` and `BPlusTreeNode` headers gained an 8-byte `lsn` field (the ARIES "page LSN" -- redo only reapplies a record newer than what's already on disk)
+- `WALRecord`/`WALWriter` (`include/wal.hpp`, `src/wal.cpp`): length-prefixed, CRC32-checked log records so a torn write at the tail (what a real crash leaves behind) is detected and cleanly discarded rather than misparsed; thread-safe (`WALWriter` and `TransactionManager` are shared between `BufferPool` and `IndexManager`, which can run on different threads)
+- `TransactionManager`: minimal auto-commit transaction concept (no multi-statement transactions yet -- that's Phase 5) purely so WAL records have a `txn_id`/`prev_lsn` chain for recovery's undo pass; `txn_id`s stay unique for the WAL file's whole lifetime (scanned from existing log on construction), not just one process's, since recovery has no checkpointing and re-scans the full log every time
+- `BufferPool` now captures a before-image at `fetchPage()` time and logs a real before/after-image `UPDATE` record whenever `unpinPage(id, true)` detects the page actually changed, auto-committing internally -- no signature changes needed on `PageManager`/`RecordManager`
+- `BPlusTree`'s persistence rewritten from "save the whole tree" to incremental dirty-node writes: a `thread_local` dirty-node set (populated via one-line `markDirty()` calls at each mutation site) replaces threading a parameter through the latch-crabbing call graph, so none of Phase 3's concurrency-critical function signatures or lock ordering changed. `IndexManager::saveNode()` logs the same before/after-image protocol as `BufferPool`, sharing one `WALWriter`/`TransactionManager` (one LSN space, one txn_id space) with the heap path
+- `RecoveryManager` (`include/recoverymanager.hpp`, `src/recoverymanager.cpp`): redo pass replays every `UPDATE`/`CLR` record newer than the target page's on-disk LSN (idempotent); undo pass reverts any txn with no `COMMIT` record, in reverse order via `prev_lsn`, writing a CLR per undone step so a crash during recovery is itself redoable
+- No checkpointing (full log scan every run) and whole-page (not byte-range) before/after images -- both deliberate v1 simplifications noted as possible Phase 7 optimizations, not correctness gaps
+- 16 new tests: `WALWriter` round-trip/corrupt-tail-discard/reopen-continuity, `TransactionManager` prev_lsn chaining, incremental-write verification (a plain insert into a multi-level tree logs ~1 record, not one per node), and crash-recovery tests covering heap redo, heap undo (including data that reached disk under steal despite never committing), index redo/undo, one shared WAL recovering interleaved heap+index writes, and a real end-to-end test using a deliberately-never-destructed `BufferPool` to simulate a crash before write-back
+- Full suite (116/116) validated stable across repeated runs, same discipline as Phase 3's concurrency suite
 
 **Systems concept taught:** ARIES fundamentals, REDO/UNDO, crash recovery, the write-ahead invariant, LSN-based page tracking.
 
@@ -142,7 +147,7 @@ Each phase builds a sentence you can say in an interview. No fluff.
 | 1 — Persist the B+ Tree | ✅ Done |
 | 2 — Buffer Pool | ✅ Done |
 | 3 — B-Tree Concurrency (Latch Crabbing + B-link) | ✅ Done |
-| 4 — Write-Ahead Log | 🔜 Next |
-| 5 — MVCC Transactions | ⏳ |
+| 4 — Write-Ahead Log | ✅ Done |
+| 5 — MVCC Transactions | 🔜 Next |
 | 6 — SQL Frontend | ⏳ |
 | 7 — Benchmarking & Polish | ⏳ |

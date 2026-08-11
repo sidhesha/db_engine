@@ -28,6 +28,8 @@ set(SOURCES
     src/catalogmanager.cpp
     src/bufferpool.cpp
     src/table.cpp
+    src/wal.cpp
+    src/recoverymanager.cpp
 )
 
 # Main executable

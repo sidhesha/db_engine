@@ -5,7 +5,7 @@
 #include <cstdint>
 
 // const int PAGE_SIZE = 4096;         // Fixed size of each page
-const int PAGE_HEADER_SIZE = 8;     // 4 bytes page_id + 2 bytes num_slots + 2 bytes free_space_offset
+const int PAGE_HEADER_SIZE = 16;    // 4 bytes page_id + 2 bytes num_slots + 2 bytes free_space_offset + 8 bytes lsn
 const int SLOT_ENTRY_SIZE = 5;      // 2 bytes offset + 2 bytes length + 1 byte is_active
 
 // Each record in a page is tracked by a slot
@@ -30,10 +30,17 @@ public:
     int getFreeSpace() const;
     int getNumSlots() const; // 1 indexed
 
+    // ARIES page LSN: the LSN of the last WAL record applied to this
+    // page. Recovery's redo pass only reapplies a record whose LSN is
+    // greater than this, so redo is idempotent.
+    uint64_t getLSN() const;
+    void setLSN(uint64_t lsn);
+
 private:
     uint32_t page_id;
     uint16_t num_slots;
     uint16_t free_space_offset;
+    uint64_t lsn = 0;
 
     std::vector<SlotEntry> slot_directory;
     std::vector<char> data; // full 4096-byte page data

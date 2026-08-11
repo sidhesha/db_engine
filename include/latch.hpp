@@ -11,6 +11,18 @@
 // state == 0   -> free
 // state == -1  -> held exclusively
 // state > 0    -> held by that many shared (reader) holders
+//
+// Writer priority: lockShared() defers (without touching `state`)
+// whenever a writer is waiting, via `waiting_writers`. Without this, a
+// latch under a continuous stream of shared acquirers -- e.g.
+// structure_latch, taken shared by every insert()'s descent -- can starve
+// an exclusive lock() indefinitely: each individual reader's hold is
+// short, but if new ones keep arriving before `state` ever reaches 0, the
+// writer's CAS never gets a window. This isn't hypothetical: confirmed by
+// hanging real 8-thread concurrent-insert runs under CPU-constrained
+// conditions (2 cores) via gdb thread dump, all spinning on this exact
+// lock with no forward progress -- the same pathology pthread_rwlock's
+// PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP mode exists to prevent.
 class RWSpinLatch {
 public:
     RWSpinLatch() = default;
@@ -26,6 +38,15 @@ public:
 
     void lockShared() {
         for (;;) {
+            if (waiting_writers.load(std::memory_order_relaxed) > 0) {
+                // A writer is queued: don't join the reader side (that's
+                // exactly the pattern that starves it). Existing readers
+                // still drain normally via unlockShared(), so `state`
+                // keeps moving toward 0 instead of being kept aloft by a
+                // constant stream of new arrivals.
+                std::this_thread::yield();
+                continue;
+            }
             int expected = state.load(std::memory_order_relaxed);
             if (expected >= 0 &&
                 state.compare_exchange_weak(expected, expected + 1,
@@ -42,11 +63,13 @@ public:
     }
 
     void lock() {
+        waiting_writers.fetch_add(1, std::memory_order_relaxed);
         for (;;) {
             int expected = 0;
             if (state.compare_exchange_weak(expected, -1,
                                              std::memory_order_acquire,
                                              std::memory_order_relaxed)) {
+                waiting_writers.fetch_sub(1, std::memory_order_relaxed);
                 return;
             }
             std::this_thread::yield();
@@ -77,6 +100,7 @@ public:
 
 private:
     std::atomic<int> state{0};
+    std::atomic<int> waiting_writers{0};
 };
 
 // RAII guards for a standalone RWSpinLatch (as opposed to LatchHandle,

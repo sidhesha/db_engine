@@ -7,6 +7,46 @@
 #include <stdexcept>
 #include <thread>
 
+namespace {
+
+// Which nodes the current thread's in-flight insert()/update()/remove()
+// call has actually mutated (created, split, merged into, had a key/rid/
+// child/separator change). Set up at the top of each of those calls and
+// torn down at the end, right around the point that used to call
+// maybeSave(). A thread_local pointer -- rather than threading a
+// DirtySet& parameter through propagateSplit/handleLeafUnderflow/
+// handleInternalUnderflow/propagateSeparatorUpdate -- so this bookkeeping
+// stays entirely additive: no signature changes, no new latch
+// acquisitions, nothing that could alter the latch-crabbing control flow
+// those functions already got right in Phase 3. Each top-level call runs
+// on one thread and never crosses threads, so thread_local scoping is
+// exactly right (and concurrent operations on the same tree, each on
+// their own thread, get their own independent dirty set).
+thread_local std::vector<std::shared_ptr<BPlusTreeNode>>* g_dirty_set = nullptr;
+
+void markDirty(const std::shared_ptr<BPlusTreeNode>& node) {
+    if (!g_dirty_set || !node) return;
+    for (auto& n : *g_dirty_set) {
+        if (n.get() == node.get()) return;  // already marked this operation
+    }
+    g_dirty_set->push_back(node);
+}
+
+// RAII scope for g_dirty_set: installs `dirty` as the active set for the
+// current thread's operation, restores the previous value (always
+// nullptr in practice, since these calls don't nest) on scope exit --
+// including via an exception, so a thrown error mid-operation can't leave
+// a stale pointer for the next call on this thread.
+struct DirtyScope {
+    std::vector<std::shared_ptr<BPlusTreeNode>>* previous;
+    explicit DirtyScope(std::vector<std::shared_ptr<BPlusTreeNode>>& dirty) : previous(g_dirty_set) {
+        g_dirty_set = &dirty;
+    }
+    ~DirtyScope() { g_dirty_set = previous; }
+};
+
+}  // namespace
+
 
 BPlusTree::BPlusTree()
     : im(nullptr) {
@@ -44,8 +84,28 @@ void BPlusTree::setParent(const std::shared_ptr<BPlusTreeNode>& child,
 
 std::shared_ptr<BPlusTreeNode> BPlusTree::getParent(const std::shared_ptr<BPlusTreeNode>& child) const {
     if (!child) return nullptr;
-    LatchHandle g(child, false);
-    return child->parent.lock();
+    std::shared_ptr<BPlusTreeNode> p;
+    {
+        LatchHandle g(child, false);
+        p = child->parent.lock();
+    }
+    if (!p) return nullptr;
+    // child->parent is a placeholder inherited at split time and only
+    // gets fixed up once that node's own propagateSplit call runs --
+    // until then it can point at an ancestor a concurrent remove() has
+    // since merged into a sibling. handleLeafUnderflow/
+    // handleInternalUnderflow never clear a merged-away node's own
+    // fields, so a dead parent would otherwise still look perfectly
+    // valid (real latch, real children) to a caller that only checks
+    // for null. Latched and released separately from child's own latch
+    // (never held together) to keep the same child-before-parent
+    // ordering every other traversal in this file uses.
+    bool dead;
+    {
+        LatchHandle gp(p, false);
+        dead = p->is_merged_away;
+    }
+    return dead ? nullptr : p;
 }
 
 LatchHandle BPlusTree::moveRight(LatchHandle node, const Key& key, bool exclusive) const {
@@ -69,7 +129,48 @@ LatchHandle BPlusTree::tryAcquireSiblingExclusive(std::shared_ptr<BPlusTreeNode>
     return LatchHandle(); // contended too long; caller falls back to another option
 }
 
+std::shared_ptr<BPlusTreeNode> BPlusTree::findAncestorForRelink(
+    const std::shared_ptr<BPlusTreeNode>& left_child) const
+{
+    auto root_snapshot = snapshotRoot();
+    if (!root_snapshot || root_snapshot.get() == left_child.get()) return nullptr;
+
+    bool target_is_leaf;
+    {
+        LatchHandle g(left_child, false);
+        target_is_leaf = left_child->is_leaf;
+    }
+
+    auto current = root_snapshot;
+    for (;;) {
+        bool current_is_leaf;
+        std::shared_ptr<BPlusTreeNode> rightmost_child;
+        {
+            LatchHandle g(current, false);
+            current_is_leaf = g->is_leaf;
+            if (!current_is_leaf && !g->children.empty()) {
+                rightmost_child = g->children.back();
+            }
+        }
+        if (current_is_leaf || !rightmost_child) {
+            return nullptr;  // reached leaves (or a childless internal node) without matching target level -- corrupt
+        }
+        bool rightmost_matches_target;
+        {
+            LatchHandle gc(rightmost_child, false);
+            rightmost_matches_target = gc->is_leaf == target_is_leaf;
+        }
+        if (rightmost_matches_target) {
+            return current;  // current's children sit at left_child's level
+        }
+        current = rightmost_child;
+    }
+}
+
 void BPlusTree::insert(const Key& key, int page_id, int slot_id) {
+    std::vector<std::shared_ptr<BPlusTreeNode>> dirty;
+    DirtyScope dirty_scope(dirty);
+
     // Shared for the whole descent (see class-level comment in
     // bplustree.hpp): excludes a concurrent structural change
     // (propagateSplit/remove()) from being mid-flight while this
@@ -104,6 +205,7 @@ void BPlusTree::insert(const Key& key, int page_id, int slot_id) {
     }
 
     current->insertInLeaf(key, page_id, slot_id);
+    markDirty(current.get());
 
     std::shared_ptr<BPlusTreeNode> split_left;
     std::shared_ptr<BPlusTreeNode> split_right;
@@ -119,6 +221,7 @@ void BPlusTree::insert(const Key& key, int page_id, int slot_id) {
         split_left = current.get();
         split_right = new_leaf;
         split_key = sk;
+        markDirty(split_right);  // brand-new node -- must be saved regardless
     }
 
     current.release();
@@ -128,7 +231,7 @@ void BPlusTree::insert(const Key& key, int page_id, int slot_id) {
         propagateSplit(ancestor_hints, split_left, split_right, split_key);
     }
 
-    maybeSave();
+    saveDirty(dirty);
 }
 
 void BPlusTree::propagateSplit(std::vector<std::shared_ptr<BPlusTreeNode>>& ancestor_hints,
@@ -154,9 +257,29 @@ void BPlusTree::propagateSplit(std::vector<std::shared_ptr<BPlusTreeNode>>& ance
         }
 
         std::shared_ptr<BPlusTreeNode> parent_hint;
-        if (!ancestor_hints.empty()) {
-            parent_hint = ancestor_hints.back();
+        // ancestor_hints was captured during insert()'s own live descent
+        // (each entry genuinely alive and latched at the moment it was
+        // visited), but insert() releases structure_latch (shared)
+        // before calling propagateSplit, which re-acquires it
+        // exclusive -- a concurrent remove() can slip into that gap and
+        // merge one of these hinted ancestors away. A stale hint can't
+        // be trusted blindly: unlike the left_child check further down,
+        // a dead parent_hint here would be used directly as `parent`
+        // with no further check, silently inserting into a node that's
+        // already unlinked from the live tree. So skip dead hints and
+        // keep trying older ones before falling back to getParent().
+        while (!ancestor_hints.empty()) {
+            auto candidate = ancestor_hints.back();
             ancestor_hints.pop_back();
+            bool dead;
+            {
+                LatchHandle g(candidate, false);
+                dead = candidate->is_merged_away;
+            }
+            if (!dead) {
+                parent_hint = candidate;
+                break;
+            }
         }
         if (!parent_hint) {
             parent_hint = getParent(left_child);
@@ -183,17 +306,98 @@ void BPlusTree::propagateSplit(std::vector<std::shared_ptr<BPlusTreeNode>>& ance
                 new_root->children.push_back(right_child);
                 root = new_root;
                 root_guard.unlock();
+                markDirty(new_root);  // brand-new node -- must be saved regardless
                 setParent(left_child, new_root);
                 setParent(right_child, new_root);
                 return;
             }
-            root_guard.unlock();
-            // Not the root: some sibling's parent fix-up simply hasn't
-            // completed yet (a very short critical section). Spin
-            // briefly until it shows up.
-            while (!parent_hint) {
-                std::this_thread::yield();
-                parent_hint = getParent(left_child);
+            // Not the root -- but if the root is *still a bare leaf*
+            // (never yet promoted to an internal node), no propagateSplit
+            // call has successfully fixed up any part of this chain, and
+            // -- critically -- none ever can while this thread holds
+            // structure_latch exclusively: fixing up a parent requires
+            // this exact lock. This isn't hypothetical: with the tree
+            // still a single leaf, every thread's first few inserts all
+            // land on that same leaf (nothing else to route to yet), so
+            // multiple threads can each independently split the frontier
+            // leaf before any of them gets exclusive access to promote
+            // the root. The exclusive lock has no ordering guarantee
+            // among waiting writers, so a "downstream" split (of a
+            // right-sibling created by an earlier split) can win that
+            // race and run before the "upstream" root promotion does --
+            // confirmed via gdb: a thread stuck here holding
+            // structure_latch while root itself sat unpromoted, verified
+            // by inspecting both threads' actual left_child/separator_key
+            // values under CPU-constrained concurrent-insert stress.
+            //
+            // Since this thread already holds the only lock that could
+            // ever fix this, do it here instead of waiting: walk root's
+            // leaf chain (next_leaf) from the front, collecting every
+            // leaf up to and including left_child (they form a
+            // contiguous prefix of the chain by construction -- each
+            // split only ever appends further right), and promote all of
+            // them under one new internal root in a single step.
+            // root->is_leaf and, below, each leaf's high_key/next_leaf
+            // were last written under that leaf's own per-node latch
+            // (by whichever thread split it) -- structure_latch being
+            // exclusive rules out concurrent *mutation* of them, but a
+            // brief latch on each node read here is what actually
+            // establishes the acquire/release pairing needed to see
+            // those writes correctly, same defensive reasoning as the
+            // left_child read above (see its comment).
+            bool root_is_leaf;
+            {
+                LatchHandle g(root, false);
+                root_is_leaf = root->is_leaf;
+            }
+            if (root_is_leaf) {
+                auto new_root = std::make_shared<BPlusTreeNode>(false);
+                auto leaf = root;
+                bool found = false;
+                while (leaf) {
+                    new_root->children.push_back(leaf);
+                    if (leaf.get() == left_child.get()) {
+                        found = true;
+                        break;
+                    }
+                    std::optional<Key> hk;
+                    std::shared_ptr<BPlusTreeNode> next;
+                    {
+                        LatchHandle g(leaf, false);
+                        hk = leaf->high_key;
+                        next = leaf->next_leaf;
+                    }
+                    if (!hk.has_value()) break;  // chain ends before reaching left_child
+                    new_root->keys.push_back(*hk);
+                    leaf = next;
+                }
+                if (!found) {
+                    root_guard.unlock();
+                    throw std::runtime_error(
+                        "propagateSplit: left_child not reachable via root's leaf chain -- tree structure corrupted");
+                }
+                root = new_root;
+                root_guard.unlock();
+                markDirty(new_root);  // brand-new node -- must be saved regardless
+                for (auto& child : new_root->children) {
+                    setParent(child, new_root);
+                }
+                parent_hint = new_root;
+            } else {
+                root_guard.unlock();
+                // Root is already internal, but left_child's parent still
+                // can't be found via hints/getParent -- can happen several
+                // generations deep when multiple threads race to extend
+                // the same B-link successor chain, not just directly
+                // under the root. findAncestorForRelink() doesn't rely on
+                // any cached/inherited pointer at all -- see its own
+                // comment for why the rightmost-spine walk always finds
+                // the right level.
+                parent_hint = findAncestorForRelink(left_child);
+                if (!parent_hint) {
+                    throw std::runtime_error(
+                        "propagateSplit: could not locate left_child's level via root's rightmost spine -- tree structure corrupted");
+                }
             }
         }
 
@@ -222,20 +426,69 @@ void BPlusTree::propagateSplit(std::vector<std::shared_ptr<BPlusTreeNode>>& ance
         parent = moveRight(std::move(parent), nav_key, true);
         parent = moveRight(std::move(parent), separator_key, true);
 
-        // Keep left_child's parent pointer accurate when it's still
-        // actually here (the common case); if a concurrent cascade
-        // moved us past it, its parent pointer was already correctly
-        // set by whoever performed that move, so there's nothing to fix.
-        auto it = std::find(parent->children.begin(), parent->children.end(), left_child);
-        if (it != parent->children.end()) {
+        // Ensure left_child itself is linked into `parent` before
+        // touching right_child at all. "Not found" here does not mean
+        // "needs inserting" -- it can also mean left_child is already
+        // correctly linked under a DIFFERENT, still-live parent, either
+        // because parent_hint for this call resolved to the wrong (but
+        // valid) ancestor, or because left_child was already validly
+        // absorbed by a concurrent remove()'s merge (which never clears
+        // the absorbed node's own fields, so a dead node can still look
+        // alive to a naive check). The only reliable signal is
+        // left_child's own recorded parent pointer.
+        //
+        // Deliberately read directly rather than via getParent(): this
+        // scope already holds `parent`'s latch exclusively, and
+        // left_child's parent pointer can legitimately already equal
+        // this exact `parent` (the ordinary not-yet-linked case) --
+        // getParent() would then try to latch a node this thread
+        // already holds, a guaranteed self-deadlock. Only latch a
+        // *different* resolved parent, never the one already held here.
+        auto left_it = std::find(parent->children.begin(), parent->children.end(), left_child);
+        if (left_it != parent->children.end()) {
             setParent(left_child, parent.get());
+        } else {
+            std::shared_ptr<BPlusTreeNode> existing_parent;
+            {
+                LatchHandle g(left_child, false);
+                existing_parent = left_child->parent.lock();
+            }
+            bool already_linked_elsewhere = false;
+            if (existing_parent && existing_parent.get() != parent.get().get()) {
+                LatchHandle g2(existing_parent, false);
+                already_linked_elsewhere = !existing_parent->is_merged_away;
+            }
+            if (!already_linked_elsewhere) {
+                // Genuinely not yet linked anywhere (or its only known
+                // parent is dead): insert fresh, using nav_key (a key
+                // already inside left_child) as its own separator.
+                int left_idx = 0;
+                while (left_idx < static_cast<int>(parent->keys.size()) && parent->keys[left_idx] < nav_key) {
+                    ++left_idx;
+                }
+                parent->keys.insert(parent->keys.begin() + left_idx, nav_key);
+                parent->children.insert(parent->children.begin() + left_idx + 1, left_child);
+                setParent(left_child, parent.get());
+            } else {
+                // left_child already lives under a different, live
+                // parent. right_child is its sibling (created by
+                // splitting it), so it belongs under that SAME true
+                // parent too -- redirect the rest of this iteration
+                // (right_child insertion, fullness/cascade check) to it
+                // instead of inserting into the wrong one.
+                parent.release();
+                parent = LatchHandle(existing_parent, true);
+                parent = moveRight(std::move(parent), nav_key, true);
+                parent = moveRight(std::move(parent), separator_key, true);
+                setParent(left_child, parent.get());
+            }
         }
 
-        // Determine the insertion position from separator_key itself
-        // via sorted-key comparison, not from left_child's array index:
-        // left_child can split more than once before any of its splits
-        // get fixed up here (its own latch is released right after
-        // each split, by design). If two such splits of the *same*
+        // Determine right_child's insertion position from separator_key
+        // itself via sorted-key comparison, not from left_child's array
+        // index: left_child can split more than once before any of its
+        // splits get fixed up here (its own latch is released right
+        // after each split, by design). If two such splits of the *same*
         // left_child get fixed up out of chronological order by two
         // different threads, "insert right after left_child's current
         // position" would place the second one to arrive *before* the
@@ -243,14 +496,22 @@ void BPlusTree::propagateSplit(std::vector<std::shared_ptr<BPlusTreeNode>>& ance
         // order. Comparing separator_key against the parent's existing
         // keys always yields the correct position regardless of
         // arrival order.
-        int key_idx = 0;
-        while (key_idx < static_cast<int>(parent->keys.size()) && parent->keys[key_idx] < separator_key) {
-            ++key_idx;
+        //
+        // right_child may already be linked too, the mirror of the
+        // left_child case above: it may have been split again by
+        // another thread and fixed up as *that* cascade's left_child
+        // before this call got here. Guard against inserting it twice.
+        auto right_it = std::find(parent->children.begin(), parent->children.end(), right_child);
+        if (right_it == parent->children.end()) {
+            int key_idx = 0;
+            while (key_idx < static_cast<int>(parent->keys.size()) && parent->keys[key_idx] < separator_key) {
+                ++key_idx;
+            }
+            parent->keys.insert(parent->keys.begin() + key_idx, separator_key);
+            parent->children.insert(parent->children.begin() + key_idx + 1, right_child);
         }
-
-        parent->keys.insert(parent->keys.begin() + key_idx, separator_key);
-        parent->children.insert(parent->children.begin() + key_idx + 1, right_child);
         setParent(right_child, parent.get());
+        markDirty(parent.get());
 
         if (!parent->isFull()) {
             return;
@@ -264,6 +525,7 @@ void BPlusTree::propagateSplit(std::vector<std::shared_ptr<BPlusTreeNode>>& ance
         new_internal->right_link = parent->right_link;
         parent->high_key = push_up_key;
         parent->right_link = new_internal;
+        markDirty(new_internal);  // brand-new node -- must be saved regardless
 
         left_child = parent.get();
         right_child = new_internal;
@@ -293,6 +555,9 @@ std::optional<RID> BPlusTree::search(const Key& key) {
 }
 
 bool BPlusTree::update(const Key& key, int new_page_id, int new_slot_id) {
+    std::vector<std::shared_ptr<BPlusTreeNode>> dirty;
+    DirtyScope dirty_scope(dirty);
+
     SharedLatchGuard structure_guard(structure_latch);
     auto root_snapshot = snapshotRoot();
     if (!root_snapshot) return false;
@@ -308,9 +573,11 @@ bool BPlusTree::update(const Key& key, int new_page_id, int new_slot_id) {
         current = std::move(child_handle);
         current = moveRight(std::move(current), key, true);
     }
+    auto node_ptr = current.get();
     bool ok = current->updateInLeaf(key, new_page_id, new_slot_id);
+    if (ok) markDirty(node_ptr);
     current.release();
-    if (ok) maybeSave();
+    if (ok) saveDirty(dirty);
     return ok;
 }
 
@@ -430,8 +697,8 @@ std::vector<std::pair<Key, RID>> BPlusTree::getAllKeyRIDPairs() const {
 
 
 bool BPlusTree::remove(const Key& key) {
-    auto root_snapshot = snapshotRoot();
-    if (!root_snapshot) return false;
+    std::vector<std::shared_ptr<BPlusTreeNode>> dirty;
+    DirtyScope dirty_scope(dirty);
 
     // Structural modification (see class-level comment in
     // bplustree.hpp): exclusive for the whole call, excluding every
@@ -441,6 +708,20 @@ bool BPlusTree::remove(const Key& key) {
     // traversal) is exactly what caused real corruption/deadlocks
     // during development.
     ExclusiveLatchGuard structure_lock(structure_latch);
+
+    // root_snapshot MUST be taken after structure_lock is held, not
+    // before: every writer of `root` (propagateSplit's promotions,
+    // this function's own root-collapse cases below) needs at least
+    // structure_latch shared, so once held exclusively, root is
+    // provably stable for the rest of this call. Snapshotting earlier
+    // leaves a real TOCTOU window: the root-collapse special case
+    // further down uses "root_snapshot was a bare leaf" as a proxy for
+    // "I'm deleting the tree's actual current root," but a concurrent
+    // propagateSplit could promote a brand-new root in between,
+    // demoting root_snapshot to a mere leftmost leaf -- this call,
+    // unaware, would then discard the entire newly-promoted subtree.
+    auto root_snapshot = snapshotRoot();
+    if (!root_snapshot) return false;
 
     // X-latch the root-to-leaf path and hold it for the entire call
     // rather than releasing early. `path` is remove()'s own verified
@@ -469,6 +750,7 @@ bool BPlusTree::remove(const Key& key) {
     int idx = static_cast<int>(it - leaf->keys.begin());
     leaf->keys.erase(it);
     leaf->rids.erase(leaf->rids.begin() + idx);
+    markDirty(leaf);
 
     // If the deleted key was the first key, update parent separator
     if (idx == 0) {
@@ -482,12 +764,24 @@ bool BPlusTree::remove(const Key& key) {
         }
     }
 
-    // Root special case
-    if (path.size() == 1 && leaf->keys.empty()) {
+    // Root special case: only nullify the tree if there's genuinely
+    // nothing left. path.size()==1 means root itself is a bare leaf
+    // (never yet promoted to internal), and this call just emptied it
+    // -- but a bare-leaf root can still have a next_leaf continuation:
+    // real content from a split that hasn't been promoted into a
+    // proper multi-level tree yet (see propagateSplit's root_is_leaf
+    // bootstrap). Nullifying root here while next_leaf still points at
+    // that continuation would silently orphan it -- the next insert(),
+    // finding root null, would bootstrap a brand-new disconnected tree
+    // from scratch. Leaving root as the (now empty) leaf instead costs
+    // nothing: its high_key/next_leaf still correctly route searches
+    // onward via moveRight, and it's cleaned up/promoted normally by
+    // whatever future split or merge touches it.
+    if (path.size() == 1 && leaf->keys.empty() && !leaf->next_leaf) {
         swapRoot(nullptr);
         path.clear();
         structure_lock.release();
-        maybeSave();
+        saveDirty(dirty);
         return true;
     }
 
@@ -497,15 +791,14 @@ bool BPlusTree::remove(const Key& key) {
     }
 
     // Release every latch this call still holds -- including
-    // structure_lock -- *before* triggering a save: save()/
-    // saveRecursive() re-latch nodes (including possibly ones still
-    // held here) and structure_latch itself (shared), so calling it
-    // while still holding any of our own locks is a guaranteed
-    // self-deadlock (same thread spinning to re-acquire something it
-    // already holds).
+    // structure_lock -- *before* triggering a save: saveDirty()/
+    // IndexManager::saveNode() do their own I/O (and WAL logging) and
+    // have no business happening while holding tree latches, and
+    // structure_latch itself (shared elsewhere) would self-deadlock if
+    // still held here.
     path.clear();
     structure_lock.release();
-    maybeSave();
+    saveDirty(dirty);
     return true;
 }
 
@@ -546,6 +839,7 @@ void BPlusTree::handleLeafUnderflow(std::vector<LatchHandle>& path) {
             left_sibling->rids.pop_back();
             parent->keys[index - 1] = node->keys.front();
             left_sibling->high_key = node->keys.front();
+            markDirty(node); markDirty(left_sibling.get()); markDirty(parent.get());
             return;
         }
     }
@@ -561,6 +855,7 @@ void BPlusTree::handleLeafUnderflow(std::vector<LatchHandle>& path) {
         right_sibling->rids.erase(right_sibling->rids.begin());
         parent->keys[index] = right_sibling->keys.front();
         node->high_key = right_sibling->keys.front();
+        markDirty(node); markDirty(right_sibling.get()); markDirty(parent.get());
         return;
     }
 
@@ -580,10 +875,12 @@ void BPlusTree::handleLeafUnderflow(std::vector<LatchHandle>& path) {
             left_sibling->rids.insert(left_sibling->rids.end(), node->rids.begin(), node->rids.end());
             left_sibling->next_leaf = node->next_leaf;
             left_sibling->high_key = node->high_key;
+            node->is_merged_away = true;
 
             parent->children.erase(parent->children.begin() + index);
             parent->keys.erase(parent->keys.begin() + index - 1);
             path.pop_back(); // release `node`: fully absorbed into left_sibling
+            markDirty(left_sibling.get()); markDirty(parent.get());
 
             if (path.size() == 1 && parent->keys.empty()) {
                 // We still hold left_sibling's own latch here, so set
@@ -617,10 +914,12 @@ void BPlusTree::handleLeafUnderflow(std::vector<LatchHandle>& path) {
         node->rids.insert(node->rids.end(), right_sibling->rids.begin(), right_sibling->rids.end());
         node->next_leaf = right_sibling->next_leaf;
         node->high_key = right_sibling->high_key;
+        right_sibling->is_merged_away = true;
 
         parent->children.erase(parent->children.begin() + index + 1);
         parent->keys.erase(parent->keys.begin() + index);
         right_sibling.release(); // fully absorbed into `node`; done with it
+        markDirty(node); markDirty(parent.get());
 
         if (path.size() == 2 && parent->keys.empty()) {
             // We still hold `node`'s own latch (it's path.back()), so
@@ -668,6 +967,7 @@ void BPlusTree::handleInternalUnderflow(std::vector<LatchHandle>& path) {
             node->children.insert(node->children.begin(), moved_child);
             setParent(moved_child, node);
             left_sibling->children.pop_back();
+            markDirty(node); markDirty(left_sibling.get()); markDirty(parent.get());
             return;
         }
     }
@@ -685,6 +985,7 @@ void BPlusTree::handleInternalUnderflow(std::vector<LatchHandle>& path) {
         node->children.push_back(moved_child);
         setParent(moved_child, node);
         right_sibling->children.erase(right_sibling->children.begin());
+        markDirty(node); markDirty(right_sibling.get()); markDirty(parent.get());
         return;
     }
 
@@ -703,10 +1004,12 @@ void BPlusTree::handleInternalUnderflow(std::vector<LatchHandle>& path) {
             }
             left_sibling->high_key = node->high_key;
             left_sibling->right_link = node->right_link;
+            node->is_merged_away = true;
 
             parent->keys.erase(parent->keys.begin() + index - 1);
             parent->children.erase(parent->children.begin() + index);
             path.pop_back(); // release `node`: fully absorbed into left_sibling
+            markDirty(left_sibling.get()); markDirty(parent.get());
 
             if (path.size() == 1 && parent->keys.empty()) {
                 // Still holding left_sibling's own latch: set its
@@ -741,10 +1044,12 @@ void BPlusTree::handleInternalUnderflow(std::vector<LatchHandle>& path) {
         }
         node->high_key = right_sibling->high_key;
         node->right_link = right_sibling->right_link;
+        right_sibling->is_merged_away = true;
 
         parent->keys.erase(parent->keys.begin() + index);
         parent->children.erase(parent->children.begin() + index + 1);
         right_sibling.release(); // fully absorbed into `node`; done with it
+        markDirty(node); markDirty(parent.get());
 
         if (path.size() == 2 && parent->keys.empty()) {
             // Still holding `node`'s own latch (it's path.back()): set
@@ -773,13 +1078,15 @@ void BPlusTree::propagateSeparatorUpdate(std::vector<LatchHandle>& path, const K
         for (size_t i = 0; i < ancestor->keys.size(); ++i) {
             if (ancestor->keys[i] == old_sep) {
                 ancestor->keys[i] = new_sep;
+                markDirty(ancestor.get());
                 // Invariant: children[i]'s high_key mirrors this
                 // separator (same bookkeeping the borrow/merge cases
                 // below already do for their own parent/sibling pair).
                 // children[i] is the *left* sibling of wherever this
                 // call's path descended at this level -- descent always
                 // steps past keys[i] when key >= keys[i], so it's never
-                // something already held in `path`.
+                // something already held in `path`. high_key isn't
+                // persisted (see rebuildLinks()), so no markDirty here.
                 LatchHandle left_child(ancestor->children[i], true);
                 left_child->high_key = new_sep;
                 return;
@@ -788,43 +1095,51 @@ void BPlusTree::propagateSeparatorUpdate(std::vector<LatchHandle>& path, const K
     }
 }
 
-void BPlusTree::maybeSave() {
-    if (im) {
-        save();
-    }
-}
-
-void BPlusTree::save() {
-    // Callers (insert()/remove()/update()) always release their own
-    // structure_latch hold before calling this (directly or via
-    // maybeSave()) -- see the comments at those release() call sites --
-    // so taking it here (shared: save() only reads/serializes, doesn't
-    // restructure) is safe, not a self-deadlock.
-    SharedLatchGuard structure_guard(structure_latch);
+void BPlusTree::saveDirty(const std::vector<std::shared_ptr<BPlusTreeNode>>& dirty) {
+    if (!im) return;
+    // Serializes IndexManager's actual file I/O across concurrent
+    // operations (its fstream isn't safe for concurrent use); not a
+    // structural lock; nothing to self-deadlock against. Unlike the old
+    // save(), this doesn't need structure_latch: that guarded a full
+    // recursive tree walk (node->children) against concurrent shape
+    // changes, and saveDirty() no longer walks anything -- `dirty` is
+    // already the fixed, concrete list of nodes this operation touched.
     std::lock_guard<std::mutex> io_lock(io_mutex);
-    auto root_snapshot = snapshotRoot();
-    if (!root_snapshot) {
-        im->setRootNodeID(-1);
-        im->flush();
-        return;
-    }
-    saveRecursive(root_snapshot);
-    im->setRootNodeID(root_snapshot->node_id);
-    im->flush();
-}
 
-void BPlusTree::saveRecursive(std::shared_ptr<BPlusTreeNode> node) {
-    if (!node) return;
-    LatchHandle guard(node, true);
-    if (node->node_id == -1) {
-        node->node_id = im->allocateNodeID();
-    }
-    if (!node->is_leaf) {
-        for (auto& child : node->children) {
-            saveRecursive(child);
+    if (!dirty.empty()) {
+        // Assign node_ids to brand-new nodes first, each under its own
+        // node's latch: a node can appear in two concurrent operations'
+        // dirty sets (e.g. one op mutates it, releases its latches, and
+        // a second op touches it again before the first op's saveDirty()
+        // runs), so the check-and-assign has to be race-free against
+        // another thread doing the same check-and-assign concurrently.
+        for (auto& node : dirty) {
+            LatchHandle guard(node, true);
+            if (node->node_id == -1) {
+                node->node_id = im->allocateNodeID();
+            }
         }
+
+        // All of this operation's node writes share one WAL transaction,
+        // so a crash mid-way through a multi-node structural change (a
+        // split cascade, a merge) undoes as a single unit rather than
+        // leaving some of the change applied and some not.
+        TransactionManager& txns = im->getTransactionManager();
+        uint64_t txn_id = txns.begin();
+        for (auto& node : dirty) {
+            // Shared: saveNode() only reads the node to serialize it.
+            // Protects against a concurrent operation mutating this same
+            // node's fields while we're reading them here (we hold none
+            // of our own operation's latches by this point).
+            LatchHandle guard(node, false);
+            im->saveNode(node, txn_id);
+        }
+        txns.commit(txn_id);
     }
-    im->saveNode(node);
+
+    auto root_snapshot = snapshotRoot();
+    im->setRootNodeID(root_snapshot ? root_snapshot->node_id : -1);
+    im->flush();
 }
 
 std::shared_ptr<BPlusTreeNode> BPlusTree::loadRecursive(int node_id) {

@@ -72,7 +72,6 @@ public:
     std::vector<std::pair<Key, RID>> getAllKeyRIDPairs() const;
     bool remove(const Key& key);
 
-    void save();
     void load();
 
 private:
@@ -115,6 +114,26 @@ private:
     // rather than risking a cycle.
     LatchHandle tryAcquireSiblingExclusive(std::shared_ptr<BPlusTreeNode> sibling) const;
 
+    // Fallback for propagateSplit when neither ancestor_hints nor
+    // getParent(left_child) find a usable parent, and root is already
+    // internal (so the root-promotion path doesn't apply either).
+    // getParent() walks an inherited-placeholder parent pointer (each
+    // split's new sibling briefly borrows its originating node's parent
+    // field until fixed up) that can itself be several generations of
+    // not-yet-linked nodes deep. This doesn't trust any cached pointer:
+    // under the caller's own exclusive structure_latch, root's
+    // children[] arrays are the sole authoritative structure, so
+    // walking only the rightmost spine (children.back() repeatedly)
+    // always reaches left_child's level -- every split, at every depth,
+    // extends the current rightmost branch, so any not-yet-linked
+    // continuation can only hang off whatever is currently rightmost.
+    // Never fans out across sibling branches, so it can't be confused
+    // by other branches sitting at a different depth. Returns nullptr
+    // if left_child is the current root (caller's is_root check already
+    // handles that) or if the tree is structurally inconsistent.
+    std::shared_ptr<BPlusTreeNode> findAncestorForRelink(
+        const std::shared_ptr<BPlusTreeNode>& left_child) const;
+
     // Phase B of a split: insert (separator_key -> right_child) into
     // left_child's parent, using `ancestor_hints` (recorded during
     // descent) as a starting point and re-verifying with moveRight in
@@ -127,8 +146,15 @@ private:
                         std::shared_ptr<BPlusTreeNode> right_child,
                         Key separator_key);
 
-    void maybeSave();
-    void saveRecursive(std::shared_ptr<BPlusTreeNode> node);
+    // Persists exactly the nodes this operation actually touched (see the
+    // thread_local dirty-set + markDirty() mechanism in bplustree.cpp),
+    // replacing the old "rewrite the whole tree every op" save(). Called
+    // once at the end of insert()/update()/remove(), after every latch
+    // this call held has been released (saveNode() itself doesn't latch,
+    // but WAL logging + IndexManager I/O has no business happening while
+    // holding tree latches). All of an operation's dirty nodes share one
+    // WAL transaction, so recovery undoes them as a single unit.
+    void saveDirty(const std::vector<std::shared_ptr<BPlusTreeNode>>& dirty);
     std::shared_ptr<BPlusTreeNode> loadRecursive(int node_id);
     void collectLeavesInOrder(std::shared_ptr<BPlusTreeNode> node,
                               std::vector<std::shared_ptr<BPlusTreeNode>>& leaves);

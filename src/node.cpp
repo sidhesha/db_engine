@@ -48,10 +48,14 @@ std::vector<char> BPlusTreeNode::serialize() const {
     };
 
     // Header
-    // node_id + is_leaf + num_keys + padding = 32 bytes
-    write_int(node_id); 
-    write_bool(is_leaf); 
+    // node_id + is_leaf + num_keys + lsn + padding = 32 bytes
+    write_int(node_id);
+    write_bool(is_leaf);
     write_int(static_cast<int>(keys.size()));
+
+    ensure_space(sizeof(lsn));
+    std::memcpy(buffer.data() + offset, &lsn, sizeof(lsn));
+    offset += sizeof(lsn);
 
     // padding up to 32 bytes
     offset = 32;
@@ -134,6 +138,10 @@ BPlusTreeNode BPlusTreeNode::deserialize(const std::vector<char>& data) {
     read_bool(node.is_leaf);
     int num_keys;
     read_int(num_keys);
+
+    ensure_readable(sizeof(node.lsn));
+    std::memcpy(&node.lsn, data.data() + offset, sizeof(node.lsn));
+    offset += sizeof(node.lsn);
 
     offset = 32;
 
