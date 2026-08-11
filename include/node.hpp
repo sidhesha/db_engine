@@ -29,6 +29,19 @@ public:
 
     std::weak_ptr<BPlusTreeNode> parent; //parent pointer
 
+    // Set true the instant handleLeafUnderflow/handleInternalUnderflow
+    // absorbs this node into a sibling and unlinks it from its parent's
+    // children[]. The object itself stays alive as long as anything
+    // still references it (e.g. a propagateSplit call queued behind
+    // structure_latch for a split this node made moments earlier) --
+    // merging never clears keys/rids/children, only copies them into
+    // the survivor. Lets propagateSplit's self-healing "link left_child
+    // if not found in parent" tell "not yet linked" apart from
+    // "already correctly unlinked by a concurrent merge" -- without
+    // this, a stale-but-alive node could be resurrected into the live
+    // tree with frozen content.
+    bool is_merged_away = false;
+
     // B-link high key: exclusive upper bound of keys reachable through
     // this node's subtree. Empty = this is the rightmost node at its
     // level. Lets a latch-crabbing reader/writer that lands on a node
