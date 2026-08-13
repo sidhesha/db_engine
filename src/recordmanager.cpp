@@ -2,7 +2,7 @@
 
 RecordManager::RecordManager(PageManager &page_manager): page_manager(page_manager){};
 
-RID RecordManager::insertRecord(const Record& record) {
+RID RecordManager::insertRecord(const Record& record, uint64_t txn_id) {
     std::vector<char> serialized = record.serialize();
 
     // Try inserting into an existing page
@@ -11,7 +11,7 @@ RID RecordManager::insertRecord(const Record& record) {
         Page page = page_manager.readPage(i);
         int slot_id = page.insertRecord(serialized);
         if (slot_id != -1) {
-            page_manager.writePage(page);
+            page_manager.writePage(page, txn_id);
             return RID{i, slot_id};
         }
     }
@@ -24,7 +24,7 @@ RID RecordManager::insertRecord(const Record& record) {
         throw std::runtime_error("Record too large to fit in a page");
     }
 
-    page_manager.writePage(new_page);
+    page_manager.writePage(new_page, txn_id);
     return RID{new_page_id, slot_id};
 }
 
@@ -35,9 +35,9 @@ Record RecordManager::readRecord(const RID& rid) {
     return Record::deserialize(data);
 }
 
-bool RecordManager::deleteRecord(const RID& rid) {
+bool RecordManager::deleteRecord(const RID& rid, uint64_t txn_id) {
     Page page = page_manager.readPage(rid.page_id);
     bool deleted = page.deleteRecord(rid.slot_id);  // marks slot invalid
-    page_manager.writePage(page);    // persist the change
+    page_manager.writePage(page, txn_id);    // persist the change
     return deleted;
 }

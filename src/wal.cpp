@@ -313,6 +313,20 @@ void TransactionManager::commit(uint64_t txn_id) {
     last_lsn_per_txn.erase(txn_id);
 }
 
+void TransactionManager::abort(uint64_t txn_id) {
+    std::lock_guard<std::mutex> lock(mu);
+    uint64_t prev_lsn = last_lsn_per_txn.count(txn_id) ? last_lsn_per_txn[txn_id] : 0;
+
+    WALRecord record;
+    record.txn_id = txn_id;
+    record.type = WALRecordType::ABORT;
+    record.prev_lsn = prev_lsn;
+    wal.append(record);
+    wal.flush();
+
+    last_lsn_per_txn.erase(txn_id);
+}
+
 uint64_t TransactionManager::appendRecord(uint64_t txn_id, WALRecordType type, WALStore store,
                                            int32_t page_id, std::vector<char> old_data,
                                            std::vector<char> new_data) {

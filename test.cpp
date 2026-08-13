@@ -25,15 +25,15 @@ static int failed = 0;
 
 #define TEST(name) \
     do { \
-        std::cout << "  " << name << "... "; \
+        std::cout << "  " << name << "... " << std::flush; \
         try {
 
 #define END_TEST \
-            std::cout << "PASS\n"; passed++; \
+            std::cout << "PASS\n" << std::flush; passed++; \
         } catch (const std::exception& e) { \
-            std::cout << "FAIL (" << e.what() << ")\n"; failed++; \
+            std::cout << "FAIL (" << e.what() << ")\n" << std::flush; failed++; \
         } catch (...) { \
-            std::cout << "FAIL (unknown)\n"; failed++; \
+            std::cout << "FAIL (unknown)\n" << std::flush; failed++; \
         } \
     } while(0)
 
@@ -1103,6 +1103,88 @@ static void test_table_restart() {
     std::remove(wal_file.c_str());
 }
 
+// ─── MVCC (Phase 5) ────────────────────────────────────────────────────────
+
+static void test_mvcc_txn_grouping() {
+    const std::string data_file = "mvcc_grouping.db";
+    const std::string index_file = "mvcc_grouping.idx";
+    const std::string wal_file = "mvcc_grouping.wal";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+    Schema schema(std::vector<Column>{{"id","int"},{"name","string"}});
+    TEST("a multi-statement transaction's heap+index writes are undone as one atomic unit on crash") {
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+
+            // Two Table::insert calls (each touching both the heap page
+            // and the index) sharing ONE caller-owned txn_id -- before
+            // Session 2's txn_id threading, these would have been two
+            // independent auto-commit transactions with no way to undo
+            // them together.
+            uint64_t txn = txns.begin();
+            t.insert({"1", "Alice"}, txn);
+            t.insert({"2", "Bob"}, txn);
+            // Deliberately no txns.commit(txn) -- simulates a crash before
+            // commit. Scope exit still flushes dirty pages to disk (the
+            // WAL's "steal" policy allows that; it's what makes the undo
+            // pass necessary in the first place), so without recovery's
+            // undo pass this data would incorrectly survive.
+        }
+        {
+            WALWriter wal(wal_file);
+            RecoveryManager recovery(wal, data_file, index_file);
+            recovery.run();
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            assert(!t.getByKey("1").has_value());
+            assert(!t.getByKey("2").has_value());
+        }
+    } END_TEST;
+    TEST("a committed multi-statement transaction's writes all survive") {
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+
+            uint64_t txn = txns.begin();
+            t.insert({"3", "Carol"}, txn);
+            t.insert({"4", "Dave"}, txn);
+            txns.commit(txn);
+        }
+        {
+            WALWriter wal(wal_file);
+            RecoveryManager recovery(wal, data_file, index_file);
+            recovery.run();
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            auto a = t.getByKey("3");
+            auto b = t.getByKey("4");
+            assert(a.has_value() && a->getFields()[1] == "Carol");
+            assert(b.has_value() && b->getFields()[1] == "Dave");
+        }
+    } END_TEST;
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+}
+
+static void test_mvcc() {
+    test_mvcc_txn_grouping();
+}
+
 // ─── BPlusTree Persistence ───────────────────────────────────────────────────
 
 static void test_bpt_persist_20() {
@@ -1662,6 +1744,9 @@ int main() {
 
     std::cout << "=== Table ===\n";
     test_table_basic(); test_table_delete(); test_table_insert_mismatch(); test_table_restart();
+
+    std::cout << "=== MVCC (Phase 5) ===\n";
+    test_mvcc();
 
     std::cout << "=== Concurrent BPlusTree (Phase 3) ===\n";
     test_concurrent_disjoint_inserts();

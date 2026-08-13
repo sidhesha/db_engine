@@ -9,7 +9,7 @@ Table::Table(const std::string& name,
     : name(name), schema(schema), page_manager(pm), record_manager(rm), index(im) {}
 
 
-RID Table::insert(const std::vector<std::string>& values) {
+RID Table::insert(const std::vector<std::string>& values, uint64_t txn_id) {
     if (values.empty()) {
         throw std::runtime_error("No values provided for insert.");
     }
@@ -20,16 +20,18 @@ RID Table::insert(const std::vector<std::string>& values) {
     Record record(values);
 
     // Delegate to RecordManager
-    RID rid = record_manager.insertRecord(record);
+    RID rid = record_manager.insertRecord(record, txn_id);
 
     // Use first column as the primary key
     std::string key = values[0];
-    index.insert(key, rid.page_id, rid.slot_id);
+    index.insert(key, rid.page_id, rid.slot_id, txn_id);
 
     return rid;
 }
 
-std::optional<Record> Table::getByKey(const std::string& key) {
+std::optional<Record> Table::getByKey(const std::string& key, uint64_t /*txn_id*/) {
+    // txn_id unused until Session 3's snapshot visibility rules land --
+    // accepted now so this signature doesn't need to change again then.
     auto rid_opt = index.search(key);
     if (!rid_opt.has_value()) {
         return std::nullopt;
@@ -38,15 +40,15 @@ std::optional<Record> Table::getByKey(const std::string& key) {
 }
 
 
-bool Table::deleteByKey(const std::string& key) {
+bool Table::deleteByKey(const std::string& key, uint64_t txn_id) {
     auto rid_opt = index.search(key);
     if (!rid_opt.has_value()) {
         return false;
     }
 
-    bool deleted = record_manager.deleteRecord(rid_opt.value());
+    bool deleted = record_manager.deleteRecord(rid_opt.value(), txn_id);
     if (deleted) {
-        index.remove(key);
+        index.remove(key, txn_id);
     }
     return deleted;
 }
