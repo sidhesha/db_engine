@@ -2,6 +2,7 @@
 
 #include <mutex>
 #include <unordered_map>
+#include "lockmanager.hpp"
 #include "transaction.hpp"
 #include "wal.hpp"
 
@@ -18,6 +19,15 @@ public:
     uint64_t begin();
     void commit(uint64_t txn_id);
     void abort(uint64_t txn_id);
+
+    // Acquires txn_id's exclusive write lock on `rid`, blocking until
+    // available -- see LockManager for the blocking/deadlock semantics.
+    // Released automatically by commit()/abort(); there's no separate
+    // release call. Deliberately doesn't take MVCCManager's own `mu`
+    // (LockManager has its own): blocking on a row lock while holding
+    // `mu` would stall every other begin()/commit()/isVisible() call for
+    // however long this wait takes, unlike everything else this class does.
+    void acquireExclusive(const RID& rid, uint64_t txn_id);
 
     // The snapshot to evaluate visibility against for a given caller.
     // txn_id == 0 -- the same "no caller-owned transaction" sentinel used
@@ -44,6 +54,7 @@ private:
     // process's lifetime. A txn_id with no entry here is necessarily from
     // an earlier process and necessarily committed -- see stateOfLocked.
     std::unordered_map<uint64_t, Transaction> transactions;
+    LockManager lock_manager;
 
     // Callers must already hold `mu`.
     TxnState stateOfLocked(uint64_t txn_id) const;

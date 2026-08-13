@@ -3,6 +3,7 @@
 #include <cstring>
 #include <thread>
 #include <atomic>
+#include <chrono>
 #include <vector>
 #include <set>
 #include "key.hpp"
@@ -19,6 +20,7 @@
 #include "table.hpp"
 #include "wal.hpp"
 #include "recoverymanager.hpp"
+#include "lockmanager.hpp"
 
 static int passed = 0;
 static int failed = 0;
@@ -1374,10 +1376,194 @@ static void test_mvcc_crash_recovery_versioning() {
     std::remove(wal_file.c_str());
 }
 
+static void test_lockmanager_basic() {
+    TEST("uncontended acquire succeeds immediately") {
+        LockManager lm;
+        RID r{1, 0};
+        lm.acquireExclusive(r, 100);
+        lm.releaseAll(100);
+    } END_TEST;
+
+    TEST("re-entrant acquire by the same transaction succeeds immediately") {
+        LockManager lm;
+        RID r{1, 0};
+        lm.acquireExclusive(r, 100);
+        lm.acquireExclusive(r, 100);  // same txn, same rid -- must not block on itself
+        lm.releaseAll(100);
+    } END_TEST;
+
+    TEST("locks on different RIDs never contend") {
+        LockManager lm;
+        RID r1{1, 0}, r2{2, 0};
+        lm.acquireExclusive(r1, 100);
+        lm.acquireExclusive(r2, 200);  // different txn, different rid -- must not block
+        lm.releaseAll(100);
+        lm.releaseAll(200);
+    } END_TEST;
+
+    TEST("a second transaction blocks until the first releases, then acquires") {
+        LockManager lm;
+        RID r{1, 0};
+        lm.acquireExclusive(r, 100);
+
+        std::atomic<bool> acquired{false};
+        std::thread waiter([&] {
+            lm.acquireExclusive(r, 200, std::chrono::milliseconds(3000));
+            acquired = true;
+            lm.releaseAll(200);
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        assert(!acquired);  // still blocked -- txn 100 hasn't released yet
+
+        lm.releaseAll(100);
+        waiter.join();
+        assert(acquired);
+    } END_TEST;
+
+    TEST("a wait that outlives its timeout throws LockTimeoutError instead of hanging forever") {
+        LockManager lm;
+        RID r{1, 0};
+        lm.acquireExclusive(r, 100);  // never released within this test
+
+        bool timed_out = false;
+        try {
+            lm.acquireExclusive(r, 200, std::chrono::milliseconds(150));
+        } catch (const LockManager::LockTimeoutError&) {
+            timed_out = true;
+        }
+        assert(timed_out);
+        lm.releaseAll(100);
+    } END_TEST;
+}
+
+static void test_lockmanager_deadlock() {
+    TEST("an A-wants-B/B-wants-A cycle is broken by aborting the younger transaction, not left to hang") {
+        // Repeated (not just run-once): CONCURRENCY_BUGS.md's own history
+        // in this codebase is that races can be as rare as 1-in-900, so a
+        // single clean pass proves little. This particular scenario is
+        // actually deterministic by construction (every possible
+        // interleaving of which thread detects the cycle first still
+        // victimizes the same, numerically-younger txn_id -- see
+        // lockmanager.cpp), but running it repeatedly is cheap and is
+        // exactly what would catch it if that reasoning were wrong.
+        for (int iter = 0; iter < 25; iter++) {
+            LockManager lm;
+            RID r1{1, 0}, r2{2, 0};
+            std::atomic<bool> txn1_holds_r1{false};
+            std::atomic<bool> txn2_holds_r2{false};
+            std::string txn1_result, txn2_result;
+
+            std::thread t1([&] {
+                try {
+                    lm.acquireExclusive(r1, 1);
+                    txn1_holds_r1 = true;
+                    while (!txn2_holds_r2) std::this_thread::yield();
+                    lm.acquireExclusive(r2, 1, std::chrono::milliseconds(3000));
+                    lm.releaseAll(1);
+                    txn1_result = "ok";
+                } catch (const LockManager::DeadlockError&) {
+                    lm.releaseAll(1);
+                    txn1_result = "deadlock";
+                } catch (const std::exception& e) {
+                    lm.releaseAll(1);
+                    txn1_result = std::string("unexpected: ") + e.what();
+                }
+            });
+            std::thread t2([&] {
+                try {
+                    lm.acquireExclusive(r2, 2);
+                    txn2_holds_r2 = true;
+                    while (!txn1_holds_r1) std::this_thread::yield();
+                    lm.acquireExclusive(r1, 2, std::chrono::milliseconds(3000));
+                    lm.releaseAll(2);
+                    txn2_result = "ok";
+                } catch (const LockManager::DeadlockError&) {
+                    lm.releaseAll(2);
+                    txn2_result = "deadlock";
+                } catch (const std::exception& e) {
+                    lm.releaseAll(2);
+                    txn2_result = std::string("unexpected: ") + e.what();
+                }
+            });
+            t1.join();
+            t2.join();
+
+            // The numerically younger transaction (2) is always the one
+            // aborted, regardless of which thread's acquireExclusive call
+            // happens to detect the cycle first.
+            if (txn1_result != "ok" || txn2_result != "deadlock") {
+                throw std::runtime_error("iteration " + std::to_string(iter) +
+                    ": txn1=" + txn1_result + " txn2=" + txn2_result);
+            }
+        }
+    } END_TEST;
+}
+
+static void test_mvcc_lock_integration() {
+    const std::string data_file = "mvcc_lock.db";
+    const std::string index_file = "mvcc_lock.idx";
+    const std::string wal_file = "mvcc_lock.wal";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+    Schema schema(std::vector<Column>{{"id","int"},{"name","string"}});
+    WALWriter wal(wal_file); TransactionManager txns(wal);
+    PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+    IndexManager im(index_file, wal, txns);
+    Table t("users", schema, pm, rm, im);
+
+    TEST("a concurrent writer genuinely blocks on Table's own lock, then correctly builds on the committed result") {
+        t.insert({"1", "Original"});  // auto-commit
+
+        uint64_t txn_a = t.beginTxn();
+        // A now holds locks on both the row it read (the original insert)
+        // and the new version this update just created -- see the
+        // acquireExclusive calls in Table::insert/updateByKey. The second
+        // one is what B below actually blocks on: by the time B looks
+        // this key up, the index already points past A to that new
+        // version.
+        assert(t.updateByKey("1", {"1", "FromA"}, txn_a));
+
+        std::atomic<bool> b_done{false};
+        std::string b_outcome;
+        std::thread writer_b([&] {
+            uint64_t txn_b = t.beginTxn();
+            bool ok = t.updateByKey("1", {"1", "FromB"}, txn_b);  // blocks until A commits/aborts
+            b_outcome = ok ? "ok" : "stale";
+            if (ok) t.commitTxn(txn_b); else t.abortTxn(txn_b);
+            b_done = true;
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        assert(!b_done);  // still blocked behind A's lock
+
+        t.commitTxn(txn_a);
+        writer_b.join();
+        assert(b_done);
+        // B was genuinely blocked ON A (not racing a stale read) and
+        // wakes to find A's version still live and now committed, so it
+        // correctly chains onto it and succeeds -- the write-write
+        // conflict serialized instead of corrupting or silently losing
+        // either write.
+        assert(b_outcome == "ok");
+
+        auto final = t.getByKey("1");
+        assert(final.has_value() && final->getFields()[1] == "FromB");
+    } END_TEST;
+
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+}
+
 static void test_mvcc() {
     test_mvcc_txn_grouping();
     test_mvcc_visibility();
     test_mvcc_crash_recovery_versioning();
+    test_lockmanager_basic();
+    test_lockmanager_deadlock();
+    test_mvcc_lock_integration();
 }
 
 // ─── BPlusTree Persistence ───────────────────────────────────────────────────

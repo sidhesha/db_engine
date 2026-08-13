@@ -31,6 +31,7 @@ set(SOURCES
     src/wal.cpp
     src/recoverymanager.cpp
     src/mvcc.cpp
+    src/lockmanager.cpp
 )
 
 # Main executable

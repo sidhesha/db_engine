@@ -74,6 +74,11 @@ RID Table::insert(const std::vector<std::string>& values, uint64_t txn_id) {
     auto existing_rid = index.search(key);
     RID prev_version{-1, -1};
     if (existing_rid.has_value()) {
+        // Blocks until no other transaction is concurrently writing this
+        // same RID -- see LockManager. Acquired before reading `existing`
+        // so that read can't observe a value another writer is
+        // mid-mutation on.
+        mvcc.acquireExclusive(existing_rid.value(), active);
         Record existing = record_manager.readRecord(existing_rid.value());
         if (existing.getDeleteTxnId() != 0) {
             prev_version = existing_rid.value();
@@ -87,6 +92,14 @@ RID Table::insert(const std::vector<std::string>& values, uint64_t txn_id) {
     Record record(values, active, prev_version);
     RID rid = record_manager.insertRecord(record, active);
     if (existing_rid.has_value()) {
+        // This new version becomes the current one for `key` the moment
+        // index.update() below runs, well before this transaction
+        // commits -- another transaction is free to index.search(key)
+        // and land on `rid` from that point on. Lock it too (always
+        // uncontended: `rid` was only just created, nothing else can
+        // know about it yet) so such a transaction blocks on *this* one
+        // instead of racing straight through unlocked.
+        mvcc.acquireExclusive(rid, active);
         index.update(key, rid.page_id, rid.slot_id, active);
     } else {
         index.insert(key, rid.page_id, rid.slot_id, active);
@@ -110,10 +123,28 @@ bool Table::updateByKey(const std::string& key, const std::vector<std::string>& 
     uint64_t active = auto_commit ? mvcc.begin() : txn_id;
     AutoCommitGuard guard(mvcc, active, auto_commit);
 
+    // A transaction that's genuinely blocked here (someone else already
+    // holds rid_opt's lock) always succeeds once woken: whoever released
+    // it either committed (rid_opt is still the live, current version --
+    // they only ever hold *their own new* version's lock, never this
+    // one's replacement, until they've moved on) or aborted (rid_opt is
+    // untouched). What isn't handled is a much narrower TOCTOU window:
+    // rid_opt was read via index.search() *before* this lock, so a third,
+    // faster transaction that races in and commits between that read and
+    // this acquireExclusive call (never actually blocking this one --
+    // nobody held the lock yet when it grabbed it) can still leave
+    // rid_opt stale. updateRecord below reports that the same way it
+    // would a genuine prior delete, rather than retrying against the new
+    // head -- a production database's UPDATE would re-fetch and retry
+    // (Postgres's EvalPlanQual), which is a meaningfully bigger feature
+    // this project doesn't take on.
+    mvcc.acquireExclusive(rid_opt.value(), active);
+
     auto new_rid = record_manager.updateRecord(rid_opt.value(), values, active);
     if (!new_rid.has_value()) {
         return false;  // already deleted -- guard aborts the no-op transaction
     }
+    mvcc.acquireExclusive(*new_rid, active);  // see the matching comment in insert()
     index.update(key, new_rid->page_id, new_rid->slot_id, active);
 
     guard.commit();
@@ -150,6 +181,8 @@ bool Table::deleteByKey(const std::string& key, uint64_t txn_id) {
     bool auto_commit = (txn_id == 0);
     uint64_t active = auto_commit ? mvcc.begin() : txn_id;
     AutoCommitGuard guard(mvcc, active, auto_commit);
+
+    mvcc.acquireExclusive(rid_opt.value(), active);  // see updateByKey's comment on staleness
 
     bool deleted = record_manager.markDeleted(rid_opt.value(), active);
     if (deleted) guard.commit();

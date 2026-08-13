@@ -25,6 +25,7 @@ void MVCCManager::commit(uint64_t txn_id) {
     // process -- unlike an aborted txn's entry, nothing ever needs to
     // distinguish "committed" from "never tracked" again.
     transactions.erase(txn_id);
+    lock_manager.releaseAll(txn_id);
 }
 
 void MVCCManager::abort(uint64_t txn_id) {
@@ -38,6 +39,11 @@ void MVCCManager::abort(uint64_t txn_id) {
         // stateOfLocked's not-found-means-committed default.
         it->second.state = TxnState::ABORTED;
     }
+    lock_manager.releaseAll(txn_id);
+}
+
+void MVCCManager::acquireExclusive(const RID& rid, uint64_t txn_id) {
+    lock_manager.acquireExclusive(rid, txn_id);
 }
 
 Snapshot MVCCManager::getSnapshot(uint64_t txn_id) {
