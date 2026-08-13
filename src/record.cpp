@@ -6,45 +6,68 @@
 Record::Record(const std::vector<std::string>& fields)
     : fields_(fields) {}
 
+Record::Record(const std::vector<std::string>& fields, uint64_t create_txn_id, RID prev_version)
+    : fields_(fields), create_txn_id_(create_txn_id), prev_version_(prev_version) {}
+
 std::vector<std::string> Record::getFields() const {
     return fields_;
 }
 
 std::vector<char> Record::serialize() const {
 
-    // steps: (int)number of fields + [length][data][length][data][length][data]... 
+    // Layout: [create_txn_id][delete_txn_id][prev_page_id][prev_slot_id]
+    // (the MVCC header, DELETE_TXN_ID_OFFSET/MVCC_HEADER_SIZE describe
+    // it) followed by the original format: (int)number of fields +
+    // [length][data][length][data]...
 
     std::vector<char> buffer;
 
-    int num_fields = static_cast<int>(fields_.size());
-    buffer.resize(sizeof(int));
-    std::memcpy(buffer.data(), &num_fields, sizeof(int));
+    auto append = [&buffer](const void* src, size_t n) {
+        size_t offset = buffer.size();
+        buffer.resize(offset + n);
+        std::memcpy(buffer.data() + offset, src, n);
+    };
 
-    // 2. Append each field as [length][data]
+    append(&create_txn_id_, sizeof(create_txn_id_));
+    append(&delete_txn_id_, sizeof(delete_txn_id_));
+    append(&prev_version_.page_id, sizeof(prev_version_.page_id));
+    append(&prev_version_.slot_id, sizeof(prev_version_.slot_id));
+
+    int num_fields = static_cast<int>(fields_.size());
+    append(&num_fields, sizeof(num_fields));
+
     for (const auto& field : fields_) {
         int len = static_cast<int>(field.size());
-        size_t offset = buffer.size();
-
-        buffer.resize(offset + sizeof(int) + len);
-        std::memcpy(buffer.data() + offset, &len, sizeof(int));
-        std::memcpy(buffer.data() + offset + sizeof(int), field.data(), len);
+        append(&len, sizeof(len));
+        append(field.data(), len);
     }
 
     return buffer;
 }
 
 Record Record::deserialize(const std::vector<char>& buffer) {
-    std::vector<std::string> fields;
-
-    size_t offset = 0;
-    if (buffer.size() < sizeof(int)) {
+    if (buffer.size() < MVCC_HEADER_SIZE + sizeof(int)) {
         throw std::runtime_error("Invalid record buffer: too small");
     }
 
+    size_t offset = 0;
+    uint64_t create_txn_id, delete_txn_id;
+    RID prev_version;
+
+    std::memcpy(&create_txn_id, buffer.data() + offset, sizeof(create_txn_id));
+    offset += sizeof(create_txn_id);
+    std::memcpy(&delete_txn_id, buffer.data() + offset, sizeof(delete_txn_id));
+    offset += sizeof(delete_txn_id);
+    std::memcpy(&prev_version.page_id, buffer.data() + offset, sizeof(prev_version.page_id));
+    offset += sizeof(prev_version.page_id);
+    std::memcpy(&prev_version.slot_id, buffer.data() + offset, sizeof(prev_version.slot_id));
+    offset += sizeof(prev_version.slot_id);
+
     int num_fields;
-    std::memcpy(&num_fields, buffer.data(), sizeof(int));
+    std::memcpy(&num_fields, buffer.data() + offset, sizeof(int));
     offset += sizeof(int);
 
+    std::vector<std::string> fields;
     for (int i = 0; i < num_fields; ++i) {
         if (offset + sizeof(int) > buffer.size()) {
             throw std::runtime_error("Invalid record buffer: length missing");
@@ -63,14 +86,16 @@ Record Record::deserialize(const std::vector<char>& buffer) {
         offset += len;
     }
 
-    return Record(fields);
+    Record rec(fields, create_txn_id, prev_version);
+    rec.setDeleteTxnId(delete_txn_id);
+    return rec;
 }
 
 size_t Record::size() const {
-    size_t total = sizeof(int); // number of fields
+    size_t total = MVCC_HEADER_SIZE + sizeof(int); // MVCC header + number of fields
     for (const auto& field : fields_) {
         total += sizeof(int);
-        total += field.size();          
+        total += field.size();
     }
     return total;
 }

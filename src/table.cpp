@@ -4,8 +4,9 @@
 Table::Table(const std::string& name,
              const Schema& schema,
              PageManager& pm,
-             RecordManager& rm)
-    : name(name), schema(schema), page_manager(pm), record_manager(rm), index() {}
+             RecordManager& rm,
+             IndexManager& im)
+    : name(name), schema(schema), page_manager(pm), record_manager(rm), index(im) {}
 
 
 RID Table::insert(const std::vector<std::string>& values) {
@@ -45,7 +46,7 @@ bool Table::deleteByKey(const std::string& key) {
 
     bool deleted = record_manager.deleteRecord(rid_opt.value());
     if (deleted) {
-        index.remove(key);  // not implemented yet
+        index.remove(key);
     }
     return deleted;
 }

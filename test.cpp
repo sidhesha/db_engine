@@ -119,6 +119,32 @@ static void test_record() {
         Record restored = Record::deserialize(r.serialize());
         assert(restored.getFields()[0].size() == 1000);
     } END_TEST;
+    TEST("MVCC header defaults to untracked/no-prev-version when unset") {
+        Record r(std::vector<std::string>{"a"});
+        assert(r.getCreateTxnId() == 0);
+        assert(r.getDeleteTxnId() == 0);
+        assert(!r.hasPrevVersion());
+    } END_TEST;
+    TEST("MVCC header round-trips through serialize/deserialize") {
+        Record r(std::vector<std::string>{"a", "b"}, 7, RID{3, 2});
+        r.setDeleteTxnId(9);
+        Record restored = Record::deserialize(r.serialize());
+        assert(restored.getCreateTxnId() == 7);
+        assert(restored.getDeleteTxnId() == 9);
+        assert(restored.hasPrevVersion());
+        assert(restored.getPrevVersion() == (RID{3, 2}));
+        assert(restored.getFields()[1] == "b");
+    } END_TEST;
+    TEST("delete_txn_id sits at a fixed offset patchable in place") {
+        Record r(std::vector<std::string>{"a"}, 1);
+        auto bytes = r.serialize();
+        uint64_t new_delete_txn_id = 5;
+        std::memcpy(bytes.data() + Record::DELETE_TXN_ID_OFFSET, &new_delete_txn_id, sizeof(new_delete_txn_id));
+        Record restored = Record::deserialize(bytes);
+        assert(restored.getCreateTxnId() == 1);   // untouched
+        assert(restored.getDeleteTxnId() == 5);   // patched in place
+        assert(restored.getFields()[0] == "a");   // body untouched
+    } END_TEST;
 }
 
 // ─── Page ────────────────────────────────────────────────────────────────────
@@ -147,12 +173,28 @@ static void test_page() {
         try { p.readRecord(slot); } catch (const std::runtime_error&) { caught = true; }
         assert(caught);
     } END_TEST;
-    TEST("double delete throws") {
+    TEST("double delete returns false instead of throwing") {
+        // Was a bug: this used to throw std::logic_error on the second
+        // call, with a dead `return false;` right after the unconditional
+        // throw. A no-op false is the correct, callable-in-a-loop result.
         Page p(0);
         int slot = p.insertRecord({'x'});
-        p.deleteRecord(slot);
+        assert(p.deleteRecord(slot));
+        assert(!p.deleteRecord(slot));
+    } END_TEST;
+    TEST("patchBytes overwrites in place without touching slot length") {
+        Page p(0);
+        int slot = p.insertRecord({'a', 'b', 'c', 'd'});
+        p.patchBytes(slot, 1, {'X', 'Y'});
+        auto r = p.readRecord(slot);
+        assert(r.size() == 4);
+        assert(r[0] == 'a' && r[1] == 'X' && r[2] == 'Y' && r[3] == 'd');
+    } END_TEST;
+    TEST("patchBytes rejects a write that would overrun the slot") {
+        Page p(0);
+        int slot = p.insertRecord({'a', 'b'});
         bool caught = false;
-        try { p.deleteRecord(slot); } catch (const std::logic_error&) { caught = true; }
+        try { p.patchBytes(slot, 1, {'X', 'Y'}); } catch (const std::out_of_range&) { caught = true; }
         assert(caught);
     } END_TEST;
     TEST("invalid slot throws") {
@@ -966,54 +1008,99 @@ static void test_recovery_end_to_end_via_real_bufferpool() {
 // ─── Table ───────────────────────────────────────────────────────────────────
 
 static void test_table_basic() {
-    const std::string file = "tbl_basic.db";
-    std::remove(file.c_str());
-    WALWriter wal(file + ".wal"); TransactionManager txns(wal);
+    const std::string data_file = "tbl_basic.db";
+    const std::string index_file = "tbl_basic.idx";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    WALWriter wal(data_file + ".wal"); TransactionManager txns(wal);
     TEST("insert and get by key") {
-        PageManager pm(file, wal, txns); RecordManager rm(pm);
-        Table t("users", Schema(std::vector<Column>{{"id","int"},{"name","string"}}), pm, rm);
+        PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+        IndexManager im(index_file, wal, txns);
+        Table t("users", Schema(std::vector<Column>{{"id","int"},{"name","string"}}), pm, rm, im);
         t.insert({"1","Alice"}); t.insert({"2","Bob"});
         auto r = t.getByKey("1");
         assert(r.has_value() && r->getFields()[1] == "Alice");
     } END_TEST;
     TEST("get nonexistent key") {
-        PageManager pm(file, wal, txns); RecordManager rm(pm);
-        Table t("x", Schema(std::vector<Column>{{"id","int"}}), pm, rm);
+        PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+        IndexManager im(index_file, wal, txns);
+        Table t("x", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im);
         assert(!t.getByKey("99").has_value());
     } END_TEST;
-    std::remove(file.c_str());
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
 }
 
 static void test_table_delete() {
-    const std::string file = "tbl_del.db";
-    std::remove(file.c_str());
-    WALWriter wal(file + ".wal"); TransactionManager txns(wal);
+    const std::string data_file = "tbl_del.db";
+    const std::string index_file = "tbl_del.idx";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    WALWriter wal(data_file + ".wal"); TransactionManager txns(wal);
     TEST("delete by key") {
-        PageManager pm(file, wal, txns); RecordManager rm(pm);
-        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm);
+        PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+        IndexManager im(index_file, wal, txns);
+        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im);
         t.insert({"1"}); assert(t.deleteByKey("1"));
         assert(!t.getByKey("1").has_value());
     } END_TEST;
     TEST("delete nonexistent") {
-        PageManager pm(file, wal, txns); RecordManager rm(pm);
-        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm);
+        PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+        IndexManager im(index_file, wal, txns);
+        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im);
         assert(!t.deleteByKey("99"));
     } END_TEST;
-    std::remove(file.c_str());
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
 }
 
 static void test_table_insert_mismatch() {
-    const std::string file = "tbl_mismatch.db";
-    std::remove(file.c_str());
+    const std::string data_file = "tbl_mismatch.db";
+    const std::string index_file = "tbl_mismatch.idx";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
     TEST("insert mismatched columns throws") {
-        WALWriter wal(file + ".wal"); TransactionManager txns(wal);
-        PageManager pm(file, wal, txns); RecordManager rm(pm);
-        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm);
+        WALWriter wal(data_file + ".wal"); TransactionManager txns(wal);
+        PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+        IndexManager im(index_file, wal, txns);
+        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im);
         bool caught = false;
         try { t.insert({"1","extra"}); } catch (const std::runtime_error&) { caught = true; }
         assert(caught);
     } END_TEST;
-    std::remove(file.c_str());
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+}
+
+static void test_table_restart() {
+    const std::string data_file = "tbl_restart.db";
+    const std::string index_file = "tbl_restart.idx";
+    const std::string wal_file = "tbl_restart.wal";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+    Schema schema(std::vector<Column>{{"id","int"},{"name","string"}});
+    TEST("Table's index survives a process restart (real IndexManager, not the disconnected in-memory default)") {
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            t.insert({"1","Alice"});
+            t.insert({"2","Bob"});
+        } // everything destructed -- simulates the process exiting cleanly
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            auto r = t.getByKey("2");
+            assert(r.has_value() && r->getFields()[1] == "Bob");
+        }
+    } END_TEST;
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
 }
 
 // ─── BPlusTree Persistence ───────────────────────────────────────────────────
@@ -1574,7 +1661,7 @@ int main() {
     test_recovery_end_to_end_via_real_bufferpool();
 
     std::cout << "=== Table ===\n";
-    test_table_basic(); test_table_delete(); test_table_insert_mismatch();
+    test_table_basic(); test_table_delete(); test_table_insert_mismatch(); test_table_restart();
 
     std::cout << "=== Concurrent BPlusTree (Phase 3) ===\n";
     test_concurrent_disjoint_inserts();

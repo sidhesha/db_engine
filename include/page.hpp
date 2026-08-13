@@ -25,6 +25,14 @@ public:
     std::vector<char> readRecord(int slot_id) const;
     bool deleteRecord(int slot_id);
 
+    // In-place overwrite of `patch.size()` bytes starting at `offset`
+    // within an existing slot's record bytes -- the slot's length is
+    // never touched, so this can't disturb any other slot's layout.
+    // Used by MVCC (Phase 5) to stamp delete_txn_id on an existing row
+    // version (see Record::DELETE_TXN_ID_OFFSET) without rewriting the
+    // whole record.
+    void patchBytes(int slot_id, size_t offset, const std::vector<char>& patch);
+
     std::vector<char> serialize();
     uint32_t getPageId() const;
     int getFreeSpace() const;
