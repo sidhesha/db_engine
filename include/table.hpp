@@ -58,7 +58,13 @@ public:
 private:
     std::string name;
     Schema schema;
-    RecordManager record_manager;
+    // Reference, not a copy: RecordManager now owns real per-instance
+    // state (its io_mutex, serializing concurrent page access -- see
+    // recordmanager.hpp), so every caller sharing one Table needs to be
+    // going through the *same* RecordManager the constructor was given,
+    // not a disconnected copy of it. Matches page_manager below, which
+    // was already a reference for the same reason.
+    RecordManager& record_manager;
     PageManager& page_manager;
     BPlusTree index;
     MVCCManager mvcc;

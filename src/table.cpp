@@ -40,7 +40,7 @@ Table::Table(const std::string& name,
              PageManager& pm,
              RecordManager& rm,
              IndexManager& im)
-    : name(name), schema(schema), page_manager(pm), record_manager(rm), index(im),
+    : name(name), schema(schema), record_manager(rm), page_manager(pm), index(im),
       mvcc(im.getTransactionManager()) {}
 
 uint64_t Table::beginTxn() { return mvcc.begin(); }

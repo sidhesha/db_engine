@@ -1,5 +1,6 @@
 #pragma once
 
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -45,4 +46,28 @@ public:
 
 private:
     PageManager& page_manager;
+    // Serializes every read-modify-write page access across concurrent
+    // callers. Row-level locking (LockManager, Phase 5 Session 4) only
+    // ever prevents two transactions from targeting the *same RID*
+    // concurrently -- it says nothing about two different RIDs that
+    // happen to physically live on the same page (routine: many small
+    // rows get packed onto few pages), and nothing below RecordManager
+    // (PageManager, BufferPool) has any synchronization of its own.
+    // Without this, two threads racing a read-page/mutate-copy/write-page
+    // sequence for different rows on the same page silently lose one
+    // side's write -- confirmed the hard way via a genuinely lost delete
+    // under the Session 5 stress test. Coarse (one mutex for the whole
+    // heap, not per-page), the same tradeoff bplustree.cpp's io_mutex
+    // already makes for the index side: correct is the priority here,
+    // not maximum write throughput under contention, and I/O dominates
+    // whatever brief serialization this adds. Doesn't reintroduce
+    // "readers block on writers" in the MVCC sense -- this is
+    // microsecond-scale physical I/O serialization, not waiting on
+    // another transaction's commit/abort, exactly like the B+ tree's own
+    // latches briefly serializing concurrent traversals.
+    std::mutex io_mutex;
+
+    // Shared by insertRecord() and updateRecord()'s new-version insert.
+    // Caller must already hold io_mutex (std::mutex isn't recursive).
+    RID insertRecordLocked(const Record& record, uint64_t txn_id);
 };

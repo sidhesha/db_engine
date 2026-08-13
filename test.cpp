@@ -1557,6 +1557,205 @@ static void test_mvcc_lock_integration() {
     std::remove(wal_file.c_str());
 }
 
+static void test_mvcc_crash_recovery_mixed_ops() {
+    const std::string data_file = "mvcc_crash_mixed.db";
+    const std::string index_file = "mvcc_crash_mixed.idx";
+    const std::string wal_file = "mvcc_crash_mixed.wal";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+    Schema schema(std::vector<Column>{{"id","int"},{"name","string"}});
+
+    TEST("a crash mid-transaction mixing insert+update+delete loses all of them atomically; a committed mix survives") {
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            t.insert({"1", "Alice"});
+            t.insert({"2", "Bob"});
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            uint64_t txn = t.beginTxn();
+            t.insert({"3", "Carol"}, txn);
+            assert(t.updateByKey("1", {"1", "AliceV2"}, txn));
+            assert(t.deleteByKey("2", txn));
+            // No commitTxn -- simulates a crash with all three kinds of
+            // write in flight under one transaction.
+        }
+        {
+            WALWriter wal(wal_file);
+            RecoveryManager recovery(wal, data_file, index_file);
+            recovery.run();
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            auto a = t.getByKey("1");
+            assert(a.has_value() && a->getFields()[1] == "Alice");  // update undone
+            assert(t.getByKey("2").has_value());                    // delete undone
+            assert(!t.getByKey("3").has_value());                   // insert undone
+
+            // Same mix again, this time committed.
+            uint64_t txn2 = t.beginTxn();
+            t.insert({"3", "Carol"}, txn2);
+            assert(t.updateByKey("1", {"1", "AliceV2"}, txn2));
+            assert(t.deleteByKey("2", txn2));
+            t.commitTxn(txn2);
+        }
+        {
+            WALWriter wal(wal_file);
+            RecoveryManager recovery(wal, data_file, index_file);
+            recovery.run();
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            auto a = t.getByKey("1");
+            assert(a.has_value() && a->getFields()[1] == "AliceV2");
+            assert(!t.getByKey("2").has_value());
+            auto c = t.getByKey("3");
+            assert(c.has_value() && c->getFields()[1] == "Carol");
+        }
+    } END_TEST;
+
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+}
+
+static void test_mvcc_stress_mixed_concurrent() {
+    const std::string data_file = "mvcc_stress.db";
+    const std::string index_file = "mvcc_stress.idx";
+    const std::string wal_file = "mvcc_stress.wal";
+
+    // Repeated-run discipline (CONCURRENCY_BUGS.md's own precedent), kept
+    // modest for local hardware -- heavier iteration counts belong in CI
+    // via a plain branch push, same as Phase 3/4's races.
+    constexpr int NUM_RUNS = 3;
+    constexpr int NUM_WRITERS = 4;
+    constexpr int KEYS_PER_WRITER = 15;
+    constexpr int NUM_INITIAL = NUM_WRITERS * KEYS_PER_WRITER;  // 60
+    constexpr int DELETES_PER_WRITER = 5;
+    constexpr int NEW_INSERTS_PER_WRITER = 10;
+
+    TEST("mixed concurrent insert/update/delete/read against a shared Table: no corruption, a stable snapshot sees no phantoms") {
+        for (int run = 0; run < NUM_RUNS; run++) {
+            std::remove(data_file.c_str());
+            std::remove(index_file.c_str());
+            std::remove(wal_file.c_str());
+            Schema schema(std::vector<Column>{{"id","string"},{"value","string"}});
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("stress", schema, pm, rm, im);
+
+            auto ownedKey = [](int i) { return "k" + std::to_string(i); };
+            auto newKey = [](int writer, int i) {
+                return "new_" + std::to_string(writer) + "_" + std::to_string(i);
+            };
+
+            for (int i = 0; i < NUM_INITIAL; i++) {
+                t.insert({ownedKey(i), "v0"});
+            }
+
+            // Reader: takes a snapshot before any writer starts, then
+            // repeatedly re-reads the same fixed set of keys while
+            // writers run concurrently. A repeatable-read snapshot must
+            // see exactly what it saw on its first pass, every time --
+            // no phantoms from the concurrent updates/deletes/inserts
+            // below, no matter how the threads interleave.
+            std::atomic<bool> writers_done{false};
+            std::atomic<bool> reader_failed{false};
+            std::string reader_failure;
+            std::thread reader([&] {
+                uint64_t reader_txn = t.beginTxn();
+                std::vector<std::optional<std::string>> baseline(NUM_INITIAL);
+                for (int i = 0; i < NUM_INITIAL; i++) {
+                    auto r = t.getByKey(ownedKey(i), reader_txn);
+                    baseline[i] = r.has_value() ? std::optional<std::string>(r->getFields()[1]) : std::nullopt;
+                }
+                while (!writers_done.load()) {
+                    for (int i = 0; i < NUM_INITIAL; i++) {
+                        auto r = t.getByKey(ownedKey(i), reader_txn);
+                        std::optional<std::string> now =
+                            r.has_value() ? std::optional<std::string>(r->getFields()[1]) : std::nullopt;
+                        if (now != baseline[i]) {
+                            reader_failed = true;
+                            reader_failure = "key " + ownedKey(i) + " changed under a stable snapshot";
+                        }
+                    }
+                    std::this_thread::yield();
+                }
+                t.commitTxn(reader_txn);
+            });
+
+            std::vector<std::thread> writers;
+            for (int w = 0; w < NUM_WRITERS; w++) {
+                writers.emplace_back([&, w] {
+                    int base = w * KEYS_PER_WRITER;
+                    for (int i = 0; i < KEYS_PER_WRITER; i++) {
+                        std::string key = ownedKey(base + i);
+                        t.updateByKey(key, {key, "v1"});
+                        t.updateByKey(key, {key, "v2"});
+                    }
+                    for (int i = 0; i < DELETES_PER_WRITER; i++) {
+                        t.deleteByKey(ownedKey(base + i));
+                    }
+                    for (int i = 0; i < NEW_INSERTS_PER_WRITER; i++) {
+                        t.insert({newKey(w, i), "fresh"});
+                    }
+                });
+            }
+            for (auto& th : writers) th.join();
+            writers_done = true;
+            reader.join();
+
+            if (reader_failed.load()) {
+                throw std::runtime_error("run " + std::to_string(run) + ": " + reader_failure);
+            }
+
+            // Disjoint key ranges per writer make the end state fully
+            // deterministic despite the concurrency above.
+            for (int w = 0; w < NUM_WRITERS; w++) {
+                int base = w * KEYS_PER_WRITER;
+                for (int i = 0; i < DELETES_PER_WRITER; i++) {
+                    if (t.getByKey(ownedKey(base + i)).has_value()) {
+                        throw std::runtime_error("run " + std::to_string(run) + ": " +
+                            ownedKey(base + i) + " should be deleted");
+                    }
+                }
+                for (int i = DELETES_PER_WRITER; i < KEYS_PER_WRITER; i++) {
+                    auto r = t.getByKey(ownedKey(base + i));
+                    if (!r.has_value() || r->getFields()[1] != "v2") {
+                        throw std::runtime_error("run " + std::to_string(run) + ": " +
+                            ownedKey(base + i) + " should read v2");
+                    }
+                }
+                for (int i = 0; i < NEW_INSERTS_PER_WRITER; i++) {
+                    auto r = t.getByKey(newKey(w, i));
+                    if (!r.has_value() || r->getFields()[1] != "fresh") {
+                        throw std::runtime_error("run " + std::to_string(run) + ": " +
+                            newKey(w, i) + " should exist");
+                    }
+                }
+            }
+        }
+    } END_TEST;
+
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+}
+
 static void test_mvcc() {
     test_mvcc_txn_grouping();
     test_mvcc_visibility();
@@ -1564,6 +1763,8 @@ static void test_mvcc() {
     test_lockmanager_basic();
     test_lockmanager_deadlock();
     test_mvcc_lock_integration();
+    test_mvcc_crash_recovery_mixed_ops();
+    test_mvcc_stress_mixed_concurrent();
 }
 
 // ─── BPlusTree Persistence ───────────────────────────────────────────────────
