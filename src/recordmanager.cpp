@@ -1,4 +1,13 @@
 #include "recordmanager.hpp"
+#include <cstring>
+
+namespace {
+std::vector<char> encodeTxnIdPatch(uint64_t txn_id) {
+    std::vector<char> patch(sizeof(txn_id));
+    std::memcpy(patch.data(), &txn_id, sizeof(txn_id));
+    return patch;
+}
+}  // namespace
 
 RecordManager::RecordManager(PageManager &page_manager): page_manager(page_manager){};
 
@@ -40,4 +49,32 @@ bool RecordManager::deleteRecord(const RID& rid, uint64_t txn_id) {
     bool deleted = page.deleteRecord(rid.slot_id);  // marks slot invalid
     page_manager.writePage(page, txn_id);    // persist the change
     return deleted;
+}
+
+std::optional<RID> RecordManager::updateRecord(const RID& old_rid,
+                                                const std::vector<std::string>& new_fields,
+                                                uint64_t txn_id) {
+    Page old_page = page_manager.readPage(old_rid.page_id);
+    Record old_record = Record::deserialize(old_page.readRecord(old_rid.slot_id));
+    if (old_record.getDeleteTxnId() != 0) {
+        return std::nullopt;  // already deleted -- nothing live to update
+    }
+
+    old_page.patchBytes(old_rid.slot_id, Record::DELETE_TXN_ID_OFFSET, encodeTxnIdPatch(txn_id));
+    page_manager.writePage(old_page, txn_id);
+
+    Record new_record(new_fields, txn_id, old_rid);
+    return insertRecord(new_record, txn_id);
+}
+
+bool RecordManager::markDeleted(const RID& rid, uint64_t txn_id) {
+    Page page = page_manager.readPage(rid.page_id);
+    Record record = Record::deserialize(page.readRecord(rid.slot_id));
+    if (record.getDeleteTxnId() != 0) {
+        return false;  // already deleted
+    }
+
+    page.patchBytes(rid.slot_id, Record::DELETE_TXN_ID_OFFSET, encodeTxnIdPatch(txn_id));
+    page_manager.writePage(page, txn_id);
+    return true;
 }

@@ -99,11 +99,17 @@ public:
                            int32_t page_id, std::vector<char> old_data,
                            std::vector<char> new_data);
 
+    // The txn_id that WOULD be assigned to the next begin() call, without
+    // actually allocating one. MVCCManager (Phase 5) uses this as a
+    // snapshot's xmax: any txn_id >= this value necessarily started after
+    // the snapshot was taken.
+    uint64_t peekNextTxnId() const;
+
 private:
     WALWriter& wal;
     uint64_t next_txn_id;
     std::unordered_map<uint64_t, uint64_t> last_lsn_per_txn;
     // Protects next_txn_id and last_lsn_per_txn: one TransactionManager
     // is shared across BufferPool and IndexManager (see WALWriter::mu).
-    std::mutex mu;
+    mutable std::mutex mu;
 };

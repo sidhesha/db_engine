@@ -1125,10 +1125,10 @@ static void test_mvcc_txn_grouping() {
             // Session 2's txn_id threading, these would have been two
             // independent auto-commit transactions with no way to undo
             // them together.
-            uint64_t txn = txns.begin();
+            uint64_t txn = t.beginTxn();
             t.insert({"1", "Alice"}, txn);
             t.insert({"2", "Bob"}, txn);
-            // Deliberately no txns.commit(txn) -- simulates a crash before
+            // Deliberately no t.commitTxn(txn) -- simulates a crash before
             // commit. Scope exit still flushes dirty pages to disk (the
             // WAL's "steal" policy allows that; it's what makes the undo
             // pass necessary in the first place), so without recovery's
@@ -1155,10 +1155,10 @@ static void test_mvcc_txn_grouping() {
             IndexManager im(index_file, wal, txns);
             Table t("users", schema, pm, rm, im);
 
-            uint64_t txn = txns.begin();
+            uint64_t txn = t.beginTxn();
             t.insert({"3", "Carol"}, txn);
             t.insert({"4", "Dave"}, txn);
-            txns.commit(txn);
+            t.commitTxn(txn);
         }
         {
             WALWriter wal(wal_file);
@@ -1181,8 +1181,203 @@ static void test_mvcc_txn_grouping() {
     std::remove(wal_file.c_str());
 }
 
+static void test_mvcc_visibility() {
+    const std::string data_file = "mvcc_vis.db";
+    const std::string index_file = "mvcc_vis.idx";
+    const std::string wal_file = "mvcc_vis.wal";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+    Schema schema(std::vector<Column>{{"id","int"},{"name","string"}});
+    WALWriter wal(wal_file); TransactionManager txns(wal);
+    PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+    IndexManager im(index_file, wal, txns);
+    Table t("users", schema, pm, rm, im);
+
+    TEST("a transaction sees its own uncommitted write, but no one else does yet") {
+        uint64_t txn = t.beginTxn();
+        t.insert({"1", "Alice"}, txn);
+
+        auto self_read = t.getByKey("1", txn);
+        assert(self_read.has_value() && self_read->getFields()[1] == "Alice");
+        assert(!t.getByKey("1").has_value());  // ad hoc read: not committed yet
+
+        t.commitTxn(txn);
+        assert(t.getByKey("1").has_value());  // committed now
+    } END_TEST;
+
+    TEST("a snapshot taken before a commit never sees it, even after that commit") {
+        uint64_t reader = t.beginTxn();
+
+        uint64_t writer = t.beginTxn();
+        t.insert({"2", "Bob"}, writer);
+        t.commitTxn(writer);
+
+        assert(!t.getByKey("2", reader).has_value());
+        t.commitTxn(reader);
+    } END_TEST;
+
+    TEST("a snapshot started after a commit does see it") {
+        uint64_t late_reader = t.beginTxn();
+        auto r = t.getByKey("2", late_reader);
+        assert(r.has_value() && r->getFields()[1] == "Bob");
+        t.commitTxn(late_reader);
+    } END_TEST;
+
+    TEST("an aborted transaction's writes are invisible to everyone, including snapshots started after the abort") {
+        uint64_t doomed = t.beginTxn();
+        t.insert({"3", "Ghost"}, doomed);
+        assert(t.getByKey("3", doomed).has_value());  // visible to itself pre-abort
+        t.abortTxn(doomed);
+
+        assert(!t.getByKey("3").has_value());
+
+        uint64_t later = t.beginTxn();
+        assert(!t.getByKey("3", later).has_value());  // still invisible to a fresh snapshot
+        t.commitTxn(later);
+    } END_TEST;
+
+    TEST("an aborted delete un-hides the row for later readers") {
+        t.insert({"4", "Persistent"});  // auto-commit
+
+        uint64_t doomed = t.beginTxn();
+        assert(t.deleteByKey("4", doomed));
+        assert(!t.getByKey("4", doomed).has_value());  // deleted from its own point of view
+        t.abortTxn(doomed);
+
+        assert(t.getByKey("4").has_value());  // delete rolled back
+    } END_TEST;
+
+    TEST("updateByKey chains a new version and repoints the index; an old snapshot still sees the pre-update value") {
+        t.insert({"5", "Original"});  // auto-commit
+        uint64_t reader = t.beginTxn();  // snapshot before the update
+
+        assert(t.updateByKey("5", {"5", "Updated"}));  // auto-commit update
+
+        auto fresh = t.getByKey("5");
+        assert(fresh.has_value() && fresh->getFields()[1] == "Updated");
+        auto old = t.getByKey("5", reader);
+        assert(old.has_value() && old->getFields()[1] == "Original");
+        t.commitTxn(reader);
+    } END_TEST;
+
+    TEST("updateByKey on a nonexistent key returns false") {
+        assert(!t.updateByKey("no-such-key", {"x", "y"}));
+    } END_TEST;
+
+    TEST("updateByKey on an already-deleted key returns false") {
+        t.insert({"7", "Temp"});
+        assert(t.deleteByKey("7"));
+        assert(!t.updateByKey("7", {"7", "Resurrected"}));
+    } END_TEST;
+
+    TEST("deleting then re-inserting the same key repoints the index instead of duplicating it") {
+        t.insert({"8", "First"});
+        assert(t.deleteByKey("8"));
+        assert(!t.getByKey("8").has_value());
+
+        t.insert({"8", "Second"});
+        auto r = t.getByKey("8");
+        assert(r.has_value() && r->getFields()[1] == "Second");
+    } END_TEST;
+
+    TEST("a snapshot predating a delete+reinsert still walks past the new version to the old one") {
+        t.insert({"9", "Before"});  // auto-commit
+        uint64_t reader = t.beginTxn();  // snapshot before the delete+reinsert
+
+        assert(t.deleteByKey("9"));       // auto-commit
+        t.insert({"9", "After"});         // auto-commit -- repoints the index, chained
+
+        auto seen_by_reader = t.getByKey("9", reader);
+        assert(seen_by_reader.has_value() && seen_by_reader->getFields()[1] == "Before");
+        auto seen_now = t.getByKey("9");
+        assert(seen_now.has_value() && seen_now->getFields()[1] == "After");
+        t.commitTxn(reader);
+    } END_TEST;
+
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+}
+
+static void test_mvcc_crash_recovery_versioning() {
+    const std::string data_file = "mvcc_crash.db";
+    const std::string index_file = "mvcc_crash.idx";
+    const std::string wal_file = "mvcc_crash.wal";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+    Schema schema(std::vector<Column>{{"id","int"},{"name","string"}});
+
+    TEST("an uncommitted update's new version is undone by recovery; the old version survives, live") {
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            t.insert({"1", "Original"});  // auto-commit, survives on its own
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            uint64_t txn = t.beginTxn();
+            assert(t.updateByKey("1", {"1", "Uncommitted"}, txn));
+            // No commitTxn -- simulates a crash mid-transaction. Both the
+            // old version's delete_txn_id patch and the new version's
+            // insert are WAL-logged under the same txn_id, so recovery's
+            // undo pass must revert them together.
+        }
+        {
+            WALWriter wal(wal_file);
+            RecoveryManager recovery(wal, data_file, index_file);
+            recovery.run();
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            auto r = t.getByKey("1");
+            assert(r.has_value() && r->getFields()[1] == "Original");
+        }
+    } END_TEST;
+
+    TEST("a committed update's new version survives recovery; the old version stays correctly superseded") {
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            uint64_t txn = t.beginTxn();
+            assert(t.updateByKey("1", {"1", "Committed"}, txn));
+            t.commitTxn(txn);
+        }
+        {
+            WALWriter wal(wal_file);
+            RecoveryManager recovery(wal, data_file, index_file);
+            recovery.run();
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            auto r = t.getByKey("1");
+            assert(r.has_value() && r->getFields()[1] == "Committed");
+        }
+    } END_TEST;
+
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+}
+
 static void test_mvcc() {
     test_mvcc_txn_grouping();
+    test_mvcc_visibility();
+    test_mvcc_crash_recovery_versioning();
 }
 
 // ─── BPlusTree Persistence ───────────────────────────────────────────────────

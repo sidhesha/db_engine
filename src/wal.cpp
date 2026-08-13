@@ -327,6 +327,11 @@ void TransactionManager::abort(uint64_t txn_id) {
     last_lsn_per_txn.erase(txn_id);
 }
 
+uint64_t TransactionManager::peekNextTxnId() const {
+    std::lock_guard<std::mutex> lock(mu);
+    return next_txn_id;
+}
+
 uint64_t TransactionManager::appendRecord(uint64_t txn_id, WALRecordType type, WALStore store,
                                            int32_t page_id, std::vector<char> old_data,
                                            std::vector<char> new_data) {
