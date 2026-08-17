@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
+#include <utility>
 #include <vector>
 
 struct BufferFrame;
@@ -47,6 +49,35 @@ public:
 private:
     std::vector<bool> ref_bits;
     std::size_t clock_hand = 0;
+
+    void ensureSized(std::size_t n);
+};
+
+// LRU-2: evicts the frame whose *2nd*-most-recent access is furthest in
+// the past, rather than plain LRU's single most-recent access. A frame
+// accessed fewer than twice has no defined 2nd-most-recent access and is
+// always the top eviction candidate (standard LRU-K rule) -- among those,
+// it falls back to plain LRU on their single most-recent access (oldest
+// first), so a run of misses spreads across every such frame instead of
+// repeatedly re-selecting the same one. This combination is what
+// specifically defends against a single sequential scan evicting every
+// genuinely hot page: a scan's pages are each touched once and cycle
+// through the "fewer than twice" bucket among themselves, while a hot
+// page touched repeatedly builds up a recent real 2nd-access time that
+// keeps it out of that bucket entirely. Uses a monotonic logical
+// counter, not wall-clock time, to avoid timer-resolution flakiness on a
+// fast in-memory workload.
+class LRU2Policy : public EvictionPolicy {
+public:
+    void recordAccess(std::size_t idx) override;
+    void reset(std::size_t idx) override;
+    int selectVictim(const std::vector<BufferFrame>& frames) override;
+
+private:
+    // {most_recent, second_most_recent} logical access times.
+    // second_most_recent == 0 means "accessed fewer than twice so far."
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> history;
+    std::uint64_t logical_clock = 0;
 
     void ensureSized(std::size_t n);
 };

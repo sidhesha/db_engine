@@ -273,9 +273,27 @@ void BPlusTree::propagateSplit(std::vector<std::shared_ptr<BPlusTreeNode>>& ance
             ancestor_hints.pop_back();
             bool dead;
             {
+                // GCC 14.2 at -O2 (only -- never seen at this project's
+                // usual -O0 debug build, first surfaced by Phase 7's
+                // benchmark target forcing -O2) misattributes a
+                // -Wstringop-overflow false positive to this scope's
+                // LatchHandle destructor, claiming its inlined
+                // RWSpinLatch::unlockShared() writes into "a region of
+                // size 0... likely at address zero." Both
+                // LatchHandle::release() and its constructor guard every
+                // access behind `if (node_)`, so a null node_ (were
+                // `candidate` ever null) never reaches the latch at all
+                // -- this is a known class of GCC false positive from
+                // aggressive inlining through shared_ptr + std::atomic,
+                // not a real bug, confirmed by node.cpp/indexmanager.cpp
+                // (same LatchHandle pattern, same -O2 build) showing zero
+                // instances of it.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
                 LatchHandle g(candidate, false);
                 dead = candidate->is_merged_away;
-            }
+            }  // g's destructor (the actual site GCC misattributes this to) fires here
+#pragma GCC diagnostic pop
             if (!dead) {
                 parent_hint = candidate;
                 break;

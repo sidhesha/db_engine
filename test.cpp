@@ -2814,6 +2814,87 @@ static void test_bp_wal_logs_mutations() {
     std::remove(wal_file.c_str());
 }
 
+// ─── Eviction Policy (Phase 7 Session 2) ──────────────────────────────────────
+
+// Drives a policy directly against a synthetic frame table -- no real
+// Page/file I/O needed, since EvictionPolicy only ever looks at
+// pin_count (see evictionpolicy.hpp). `resident` tracks which page_id
+// (if any) is parallel-tracked as living in each frame, standing in for
+// what BufferPool's own frames[i].page/page_id would otherwise say.
+// Returns the number of hits in the final re-access pass over the hot
+// set, which is the one number both policies are compared on.
+namespace {
+constexpr std::size_t EVICTION_TEST_NUM_FRAMES = 64;
+constexpr int EVICTION_TEST_HOT_SET = 20;
+constexpr int EVICTION_TEST_SCAN_LEN = 300;  // >> NUM_FRAMES, guarantees real eviction pressure
+}  // namespace
+
+static int runEvictionWorkload(EvictionPolicy& policy) {
+    constexpr std::size_t NUM_FRAMES = EVICTION_TEST_NUM_FRAMES;
+    constexpr int HOT_SET = EVICTION_TEST_HOT_SET;
+    constexpr int SCAN_LEN = EVICTION_TEST_SCAN_LEN;
+
+    std::vector<BufferFrame> frames(NUM_FRAMES);
+    std::vector<int> resident(NUM_FRAMES, -1);
+
+    auto access = [&](int page_id) -> bool {
+        for (std::size_t i = 0; i < NUM_FRAMES; i++) {
+            if (resident[i] == page_id) {
+                policy.recordAccess(i);
+                return true;  // hit
+            }
+        }
+        int idx = policy.selectVictim(frames);
+        assert(idx >= 0);
+        resident[static_cast<std::size_t>(idx)] = page_id;
+        policy.reset(static_cast<std::size_t>(idx));
+        policy.recordAccess(static_cast<std::size_t>(idx));
+        return false;  // miss
+    };
+
+    // Warm the hot set across 3 rounds, so each hot page has a real
+    // (non-zero, recent) 2nd-most-recent access time.
+    for (int round = 0; round < 3; round++) {
+        for (int i = 0; i < HOT_SET; i++) access(1000 + i);
+    }
+
+    // A long scan of entirely distinct pages, each touched exactly once
+    // -- the scenario ROADMAP.md names LRU-2 as specifically defending
+    // against ("a single range scan won't evict hot internal nodes").
+    for (int i = 0; i < SCAN_LEN; i++) access(2000 + i);
+
+    // Re-touch the hot set once more; count hits.
+    int hits = 0;
+    for (int i = 0; i < HOT_SET; i++) {
+        if (access(1000 + i)) hits++;
+    }
+    return hits;
+}
+
+static void test_eviction_policy_shootout() {
+    TEST("LRU-2 keeps the hot set resident through a long scan; clock-sweep does not") {
+        ClockSweepPolicy clock_policy;
+        LRU2Policy lru2_policy;
+
+        int clock_hits = runEvictionWorkload(clock_policy);
+        int lru2_hits = runEvictionWorkload(lru2_policy);
+
+        // Every hot page has a real 2nd-access time; every scan page
+        // doesn't (touched once). LRU-2 structurally never picks a hot
+        // page over a once-touched scan page or an empty frame, so it
+        // should come out of the scan with every hot page still
+        // resident, regardless of how long the scan runs.
+        assert(lru2_hits == EVICTION_TEST_HOT_SET);
+        // Clock-sweep's ref_bit only buys one extra sweep of protection,
+        // not "was historically popular" -- a scan long enough to cycle
+        // the clock hand around the pool multiple times (300 fetches
+        // against 64 frames here) evicts hot pages just like anything
+        // else once their ref_bit has already been cleared and not
+        // re-set since.
+        assert(clock_hits < lru2_hits);
+    } END_TEST;
+}
+
 // ─── Concurrent BPlusTree (Phase 3: latch crabbing + B-link) ─────────────────
 // No ThreadSanitizer on this MinGW toolchain (-fsanitize=thread fails to
 // link), so these lean on volume + varied access patterns across many
@@ -2995,6 +3076,8 @@ int main() {
     std::cout << "=== BufferPool ===\n";
     test_bp_fetch_unpin(); test_bp_write_readback(); test_bp_eviction(); test_bp_dirty_flush(); test_bp_sequential_ids();
     test_bp_wal_logs_mutations();
+    std::cout << "=== Eviction Policy (Phase 7) ===\n";
+    test_eviction_policy_shootout();
 
     std::cout << "=== PageManager ===\n";
     test_pm_alloc(); test_pm_readback(); test_pm_multi();
