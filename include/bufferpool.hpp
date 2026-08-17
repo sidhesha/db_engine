@@ -29,7 +29,7 @@ struct BufferFrame {
 
 class BufferPool {
 public:
-    static constexpr int NUM_FRAMES = 64;
+    static constexpr int DEFAULT_NUM_FRAMES = 64;
 
     // wal/txns must outlive this BufferPool. They're taken by reference
     // (not owned) because a correct WAL spans every store in the engine --
@@ -43,9 +43,15 @@ public:
     // pre-Phase-7 caller) -- Phase 7's eviction-policy shootout
     // constructs a BufferPool with LRU2Policy instead to compare the two
     // head to head.
+    // num_frames defaults to DEFAULT_NUM_FRAMES (64, source-compatible
+    // with every pre-Phase-7 caller) -- Phase 7's buffer-pool-on-vs-off
+    // benchmark runs the same, real BufferPool at num_frames=1 (evicts on
+    // nearly every access, functionally "no cache") against the default,
+    // rather than maintaining a second, parallel no-cache implementation.
     BufferPool(const std::string& filename, WALWriter& wal, TransactionManager& txns,
                uint32_t table_id = 0,
-               std::unique_ptr<EvictionPolicy> policy = std::make_unique<ClockSweepPolicy>());
+               std::unique_ptr<EvictionPolicy> policy = std::make_unique<ClockSweepPolicy>(),
+               int num_frames = DEFAULT_NUM_FRAMES);
     ~BufferPool();
 
     Page& fetchPage(int page_id);

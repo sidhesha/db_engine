@@ -5,9 +5,9 @@
 #include <stdexcept>
 
 BufferPool::BufferPool(const std::string& fname, WALWriter& wal, TransactionManager& txns,
-                       uint32_t table_id, std::unique_ptr<EvictionPolicy> policy)
+                       uint32_t table_id, std::unique_ptr<EvictionPolicy> policy, int num_frames)
     : filename(fname), next_page_id(0), wal(wal), txns(txns), table_id(table_id),
-      frames(NUM_FRAMES), policy(std::move(policy)) {
+      frames(num_frames), policy(std::move(policy)) {
     openFile();
 
     std::filesystem::path path(filename);
@@ -133,9 +133,9 @@ int BufferPool::getNextPageId() const {
 }
 
 void BufferPool::flush() {
-    for (int i = 0; i < NUM_FRAMES; i++) {
+    for (std::size_t i = 0; i < frames.size(); i++) {
         if (frames[i].page && frames[i].dirty) {
-            writePageToDisk(i);
+            writePageToDisk(static_cast<int>(i));
             frames[i].dirty = false;
         }
     }
@@ -143,9 +143,9 @@ void BufferPool::flush() {
 }
 
 int BufferPool::findFrame(int page_id) const {
-    for (int i = 0; i < NUM_FRAMES; i++) {
+    for (std::size_t i = 0; i < frames.size(); i++) {
         if (frames[i].page && frames[i].page_id == page_id) {
-            return i;
+            return static_cast<int>(i);
         }
     }
     return -1;
