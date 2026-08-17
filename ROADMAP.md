@@ -115,17 +115,50 @@ No shortcuts — each concept mirrors how a real database (PostgreSQL/InnoDB) wo
 
 ---
 
-## Phase 7: Benchmarking & Polish (ongoing)
+## ✅ Phase 7: Benchmarking & Polish (COMPLETE)
 **What:** Measure and optimize.
 **Why:** Numbers on a resume.
 
-**Plan:**
-- Insert throughput (rows/s), point lookup latency, range scan speed
-- YCSB-style workload A (50% read / 50% update)
-- Compare: no buffer pool vs. buffer pool → shows your cache works
-- Compare: single-threaded vs. B-link concurrent → shows your latching works
-- **Eviction policy shootout: clock-sweep vs. LRU-2** — implement a pluggable `EvictionPolicy` interface so both policies can be swapped at runtime. LRU-2 tracks the 2nd-most-recent access time per page to prevent scan pollution (a single range scan won't evict hot internal nodes).
-- fuzz testing: random operations, assert no crash
+**Done:** Full write-up with real numbers, machine spec, and honest commentary (including where the
+concurrency benchmark *doesn't* scale and why) is in `BENCHMARKS.md`. Run `build\db_engine_bench.exe`
+(a new, `-O2`-forced target separate from the `-O0` debug build the test suite uses — see
+`CMakeLists.txt`) to reproduce.
+
+- New `EvictionPolicy` interface (`include/evictionpolicy.hpp`): `BufferPool::evictFrame()`'s inline
+  clock-sweep logic was pulled out behind `recordAccess`/`reset`/`selectVictim`, ported as
+  `ClockSweepPolicy` with zero behavior change (verified: all 7 pre-existing `BufferPool` tests pass
+  unmodified). `LRU2Policy` tracks each frame's last two logical access times, falling back to plain
+  LRU among frames accessed fewer than twice — that fallback tiebreak isn't optional polish; an
+  initial version without it kept re-selecting the same frame on every miss instead of spreading
+  across the pool, caught by the shootout test's own assertion failing.
+- **Eviction policy shootout** (`test_eviction_policy_shootout` + `bench.cpp`): a 20-page hot set
+  warmed across 3 rounds, a 300-page sequential scan (~4.7x the 64-frame pool), then the hot set
+  re-touched — clock-sweep comes out at 0/20 hot pages still resident, LRU-2 at 20/20. This is the
+  literal scenario named above ("a single range scan won't evict hot internal nodes"), demonstrated
+  with a real assertion, not just an interface existing.
+- **Buffer pool on/off**: `BufferPool::NUM_FRAMES` became a runtime constructor parameter
+  (`DEFAULT_NUM_FRAMES = 64`, source-compatible with every existing caller) so the *same* real
+  `BufferPool` runs at `num_frames=1` (evicts on nearly every access, functionally "no cache") against
+  the default — a genuine comparison without a second, parallel no-cache implementation to maintain.
+  Result: ~69x more fetches/s cached vs. uncached on a repeatedly-accessed working set.
+- **Single-threaded vs. concurrent B-link**: no code path to toggle — Phase 3's latch crabbing is
+  unconditional — so this is purely a benchmark driver varying its own thread count (1/2/4/8) against
+  one always-concurrent-safe `BPlusTree`.
+- **Insert throughput / point lookup latency / range scan / YCSB workload A**: `bench.cpp`, through the
+  full `Table` (WAL + MVCC + B+ tree) stack for realistic numbers, not an isolated index benchmark.
+- **Model-based fuzz testing** (`test_fuzz_table`): not crash-only — a shadow `std::unordered_map`
+  mirrors each key's expected live value through 3,000 random `insert`/`updateByKey`/`deleteByKey`/
+  `getByKey` calls, catching silent wrong-answer bugs a crash-only fuzzer would miss. A genuinely
+  random-per-run seed is printed unconditionally so any run is reproducible; verified stable across 7
+  runs with 7 different seeds.
+- Building at `-O2` for the first time in this project's history (the new bench target) surfaced a
+  genuine GCC 14.2 `-Wstringop-overflow` false positive in `BPlusTree::propagateSplit`'s `LatchHandle`
+  destructor (a heavily-inlined `shared_ptr` + `std::atomic` chain) — verified as a false positive
+  (both `LatchHandle::release()` and its constructor guard every access behind `if (node_)`) and
+  suppressed narrowly with a documented `#pragma GCC diagnostic` push/ignore/pop around just that one
+  scope, not a blanket suppression.
+
+**Systems concept taught:** Benchmarking methodology, cache hit-rate analysis, LRU-K eviction, model-based fuzz testing.
 
 ---
 
@@ -139,6 +172,7 @@ No shortcuts — each concept mirrors how a real database (PostgreSQL/InnoDB) wo
 | 4 | "I implemented a write-ahead log with ARIES-style crash recovery" |
 | 5 | "I built MVCC with undo logs — readers never block writers, exactly like PostgreSQL/InnoDB" |
 | 6 | "I wrote a SQL parser and a TCP server so clients can query the database" |
+| 7 | "I benchmarked it end to end — a pluggable eviction policy (LRU-2 beats clock-sweep 100% vs. 0% under scan pollution), a ~69x cache speedup, and a model-based fuzzer, with real numbers to back it up" |
 
 Each phase builds a sentence you can say in an interview. No fluff.
 
@@ -154,4 +188,4 @@ Each phase builds a sentence you can say in an interview. No fluff.
 | 4 — Write-Ahead Log | ✅ Done |
 | 5 — MVCC Transactions | ✅ Done |
 | 6 — SQL Frontend | ✅ Done |
-| 7 — Benchmarking & Polish | 🔜 Next |
+| 7 — Benchmarking & Polish | ✅ Done |
