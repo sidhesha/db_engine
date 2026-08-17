@@ -1,8 +1,9 @@
 #include "pagemanager.hpp"
 #include <cstring>
 
-PageManager::PageManager(const std::string& fname, WALWriter& wal, TransactionManager& txns)
-    : buffer_pool(fname, wal, txns) {}
+PageManager::PageManager(const std::string& fname, WALWriter& wal, TransactionManager& txns,
+                          uint32_t table_id)
+    : buffer_pool(fname, wal, txns, table_id) {}
 
 PageManager::~PageManager() {
     buffer_pool.flush();

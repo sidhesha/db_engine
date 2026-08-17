@@ -6,6 +6,7 @@
 #include <chrono>
 #include <vector>
 #include <set>
+#include <filesystem>
 #include "key.hpp"
 #include "schema.hpp"
 #include "record.hpp"
@@ -21,6 +22,8 @@
 #include "wal.hpp"
 #include "recoverymanager.hpp"
 #include "lockmanager.hpp"
+#include "mvcc.hpp"
+#include "database.hpp"
 
 static int passed = 0;
 static int failed = 0;
@@ -1018,7 +1021,8 @@ static void test_table_basic() {
     TEST("insert and get by key") {
         PageManager pm(data_file, wal, txns); RecordManager rm(pm);
         IndexManager im(index_file, wal, txns);
-        Table t("users", Schema(std::vector<Column>{{"id","int"},{"name","string"}}), pm, rm, im);
+        MVCCManager mvcc(txns);
+        Table t("users", Schema(std::vector<Column>{{"id","int"},{"name","string"}}), pm, rm, im, mvcc);
         t.insert({"1","Alice"}); t.insert({"2","Bob"});
         auto r = t.getByKey("1");
         assert(r.has_value() && r->getFields()[1] == "Alice");
@@ -1026,7 +1030,8 @@ static void test_table_basic() {
     TEST("get nonexistent key") {
         PageManager pm(data_file, wal, txns); RecordManager rm(pm);
         IndexManager im(index_file, wal, txns);
-        Table t("x", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im);
+        MVCCManager mvcc(txns);
+        Table t("x", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im, mvcc);
         assert(!t.getByKey("99").has_value());
     } END_TEST;
     std::remove(data_file.c_str());
@@ -1042,14 +1047,16 @@ static void test_table_delete() {
     TEST("delete by key") {
         PageManager pm(data_file, wal, txns); RecordManager rm(pm);
         IndexManager im(index_file, wal, txns);
-        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im);
+        MVCCManager mvcc(txns);
+        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im, mvcc);
         t.insert({"1"}); assert(t.deleteByKey("1"));
         assert(!t.getByKey("1").has_value());
     } END_TEST;
     TEST("delete nonexistent") {
         PageManager pm(data_file, wal, txns); RecordManager rm(pm);
         IndexManager im(index_file, wal, txns);
-        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im);
+        MVCCManager mvcc(txns);
+        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im, mvcc);
         assert(!t.deleteByKey("99"));
     } END_TEST;
     std::remove(data_file.c_str());
@@ -1065,7 +1072,8 @@ static void test_table_insert_mismatch() {
         WALWriter wal(data_file + ".wal"); TransactionManager txns(wal);
         PageManager pm(data_file, wal, txns); RecordManager rm(pm);
         IndexManager im(index_file, wal, txns);
-        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im);
+        MVCCManager mvcc(txns);
+        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im, mvcc);
         bool caught = false;
         try { t.insert({"1","extra"}); } catch (const std::runtime_error&) { caught = true; }
         assert(caught);
@@ -1087,7 +1095,8 @@ static void test_table_restart() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             t.insert({"1","Alice"});
             t.insert({"2","Bob"});
         } // everything destructed -- simulates the process exiting cleanly
@@ -1095,7 +1104,8 @@ static void test_table_restart() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             auto r = t.getByKey("2");
             assert(r.has_value() && r->getFields()[1] == "Bob");
         }
@@ -1103,6 +1113,146 @@ static void test_table_restart() {
     std::remove(data_file.c_str());
     std::remove(index_file.c_str());
     std::remove(wal_file.c_str());
+}
+
+// ─── Database (Phase 6 Session 1: multi-table storage) ───────────────────────
+
+static void test_database_two_tables_survive_restart() {
+    const std::string dir = "db_multitable_restart";
+    std::filesystem::remove_all(dir);
+
+    TEST("two tables, each with their own heap+index files, both survive a process restart") {
+        {
+            Database db(dir);
+            db.createTable("users", Schema(std::vector<Column>{{"id","int"},{"name","string"}}));
+            db.createTable("products", Schema(std::vector<Column>{{"sku","string"},{"price","int"}}));
+            db.getTable("users").insert({"1", "Alice"});
+            db.getTable("users").insert({"2", "Bob"});
+            db.getTable("products").insert({"a1", "100"});
+        }  // Database destructed -- simulates a clean process exit
+        {
+            Database db(dir);
+            assert(db.hasTable("users") && db.hasTable("products"));
+
+            auto alice = db.getTable("users").getByKey("1");
+            assert(alice.has_value() && alice->getFields()[1] == "Alice");
+            auto bob = db.getTable("users").getByKey("2");
+            assert(bob.has_value() && bob->getFields()[1] == "Bob");
+
+            auto sku = db.getTable("products").getByKey("a1");
+            assert(sku.has_value() && sku->getFields()[1] == "100");
+        }
+    } END_TEST;
+
+    std::filesystem::remove_all(dir);
+}
+
+static void test_database_crash_spanning_two_tables_undone_atomically() {
+    const std::string dir = "db_multitable_crash";
+    std::filesystem::remove_all(dir);
+
+    TEST("a crash mid-transaction that touched two different tables loses both tables' writes atomically") {
+        {
+            Database db(dir);
+            db.createTable("a", Schema(std::vector<Column>{{"id", "int"}}));
+            db.createTable("b", Schema(std::vector<Column>{{"id", "int"}}));
+        }
+        {
+            Database db(dir);
+            uint64_t txn = db.beginTxn();
+            db.getTable("a").insert({"1"}, txn);
+            db.getTable("b").insert({"1"}, txn);
+            // No commitTxn -- simulates a crash with one transaction's
+            // writes in flight across two different tables' heaps and
+            // indexes, all sharing this one Database's WAL.
+        }
+        {
+            // Database's constructor runs RecoveryManager itself before
+            // this scope's own reads -- this is the actual test.
+            Database db(dir);
+            assert(!db.getTable("a").getByKey("1").has_value());
+            assert(!db.getTable("b").getByKey("1").has_value());
+
+            // Prove the WAL/txn_id space really was shared (not two
+            // coincidentally-successful independent recoveries): commit a
+            // transaction touching both tables afterward and confirm it
+            // takes effect normally.
+            uint64_t txn2 = db.beginTxn();
+            db.getTable("a").insert({"1"}, txn2);
+            db.getTable("b").insert({"1"}, txn2);
+            db.commitTxn(txn2);
+            assert(db.getTable("a").getByKey("1").has_value());
+            assert(db.getTable("b").getByKey("1").has_value());
+        }
+    } END_TEST;
+
+    std::filesystem::remove_all(dir);
+}
+
+static void test_recovery_multitable_routing() {
+    const std::string wal_file = "recovery_multitable.wal";
+    const std::string a_heap = "recovery_multitable_a.heap", a_idx = "recovery_multitable_a.idx";
+    const std::string b_heap = "recovery_multitable_b.heap", b_idx = "recovery_multitable_b.idx";
+    for (const std::string& f : {wal_file, a_heap, a_idx, b_heap, b_idx}) std::remove(f.c_str());
+    Schema schema(std::vector<Column>{{"id", "int"}});
+
+    TEST("RecoveryManager's undo pass on table A's WAL records never touches table B's files") {
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm_a(a_heap, wal, txns, /*table_id=*/0); RecordManager rm_a(pm_a);
+            IndexManager im_a(a_idx, wal, txns, /*table_id=*/0);
+            PageManager pm_b(b_heap, wal, txns, /*table_id=*/1); RecordManager rm_b(pm_b);
+            IndexManager im_b(b_idx, wal, txns, /*table_id=*/1);
+            MVCCManager mvcc(txns);
+            Table ta("a", schema, pm_a, rm_a, im_a, mvcc);
+            Table tb("b", schema, pm_b, rm_b, im_b, mvcc);
+
+            tb.insert({"1"});  // auto-commit -- should survive recovery untouched
+        }
+        {
+            // Table A gets an uncommitted write left dangling -- table B
+            // is never even opened in this scope.
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm_a(a_heap, wal, txns, /*table_id=*/0); RecordManager rm_a(pm_a);
+            IndexManager im_a(a_idx, wal, txns, /*table_id=*/0);
+            MVCCManager mvcc(txns);
+            Table ta("a", schema, pm_a, rm_a, im_a, mvcc);
+            uint64_t txn = ta.beginTxn();
+            ta.insert({"1"}, txn);
+            // no commit
+        }
+        {
+            WALWriter wal(wal_file);
+            std::unordered_map<uint32_t, RecoveryManager::TableFiles> tables{
+                {0u, RecoveryManager::TableFiles{a_heap, a_idx}},
+                {1u, RecoveryManager::TableFiles{b_heap, b_idx}},
+            };
+            RecoveryManager recovery(wal, tables);
+            recovery.run();
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm_a(a_heap, wal, txns, /*table_id=*/0); RecordManager rm_a(pm_a);
+            IndexManager im_a(a_idx, wal, txns, /*table_id=*/0);
+            PageManager pm_b(b_heap, wal, txns, /*table_id=*/1); RecordManager rm_b(pm_b);
+            IndexManager im_b(b_idx, wal, txns, /*table_id=*/1);
+            MVCCManager mvcc(txns);
+            Table ta("a", schema, pm_a, rm_a, im_a, mvcc);
+            Table tb("b", schema, pm_b, rm_b, im_b, mvcc);
+
+            assert(!ta.getByKey("1").has_value());  // table A's uncommitted insert was undone
+            auto b1 = tb.getByKey("1");              // table B's committed row is untouched
+            assert(b1.has_value() && b1->getFields()[0] == "1");
+        }
+    } END_TEST;
+
+    for (const std::string& f : {wal_file, a_heap, a_idx, b_heap, b_idx}) std::remove(f.c_str());
+}
+
+static void test_database() {
+    test_database_two_tables_survive_restart();
+    test_database_crash_spanning_two_tables_undone_atomically();
+    test_recovery_multitable_routing();
 }
 
 // ─── MVCC (Phase 5) ────────────────────────────────────────────────────────
@@ -1120,7 +1270,8 @@ static void test_mvcc_txn_grouping() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
 
             // Two Table::insert calls (each touching both the heap page
             // and the index) sharing ONE caller-owned txn_id -- before
@@ -1145,7 +1296,8 @@ static void test_mvcc_txn_grouping() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             assert(!t.getByKey("1").has_value());
             assert(!t.getByKey("2").has_value());
         }
@@ -1155,7 +1307,8 @@ static void test_mvcc_txn_grouping() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
 
             uint64_t txn = t.beginTxn();
             t.insert({"3", "Carol"}, txn);
@@ -1171,7 +1324,8 @@ static void test_mvcc_txn_grouping() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             auto a = t.getByKey("3");
             auto b = t.getByKey("4");
             assert(a.has_value() && a->getFields()[1] == "Carol");
@@ -1194,7 +1348,8 @@ static void test_mvcc_visibility() {
     WALWriter wal(wal_file); TransactionManager txns(wal);
     PageManager pm(data_file, wal, txns); RecordManager rm(pm);
     IndexManager im(index_file, wal, txns);
-    Table t("users", schema, pm, rm, im);
+    MVCCManager mvcc(txns);
+    Table t("users", schema, pm, rm, im, mvcc);
 
     TEST("a transaction sees its own uncommitted write, but no one else does yet") {
         uint64_t txn = t.beginTxn();
@@ -1316,14 +1471,16 @@ static void test_mvcc_crash_recovery_versioning() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             t.insert({"1", "Original"});  // auto-commit, survives on its own
         }
         {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             uint64_t txn = t.beginTxn();
             assert(t.updateByKey("1", {"1", "Uncommitted"}, txn));
             // No commitTxn -- simulates a crash mid-transaction. Both the
@@ -1340,7 +1497,8 @@ static void test_mvcc_crash_recovery_versioning() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             auto r = t.getByKey("1");
             assert(r.has_value() && r->getFields()[1] == "Original");
         }
@@ -1351,7 +1509,8 @@ static void test_mvcc_crash_recovery_versioning() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             uint64_t txn = t.beginTxn();
             assert(t.updateByKey("1", {"1", "Committed"}, txn));
             t.commitTxn(txn);
@@ -1365,7 +1524,8 @@ static void test_mvcc_crash_recovery_versioning() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             auto r = t.getByKey("1");
             assert(r.has_value() && r->getFields()[1] == "Committed");
         }
@@ -1511,7 +1671,8 @@ static void test_mvcc_lock_integration() {
     WALWriter wal(wal_file); TransactionManager txns(wal);
     PageManager pm(data_file, wal, txns); RecordManager rm(pm);
     IndexManager im(index_file, wal, txns);
-    Table t("users", schema, pm, rm, im);
+    MVCCManager mvcc(txns);
+    Table t("users", schema, pm, rm, im, mvcc);
 
     TEST("a concurrent writer genuinely blocks on Table's own lock, then correctly builds on the committed result") {
         t.insert({"1", "Original"});  // auto-commit
@@ -1571,7 +1732,8 @@ static void test_mvcc_crash_recovery_mixed_ops() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             t.insert({"1", "Alice"});
             t.insert({"2", "Bob"});
         }
@@ -1579,7 +1741,8 @@ static void test_mvcc_crash_recovery_mixed_ops() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             uint64_t txn = t.beginTxn();
             t.insert({"3", "Carol"}, txn);
             assert(t.updateByKey("1", {"1", "AliceV2"}, txn));
@@ -1596,7 +1759,8 @@ static void test_mvcc_crash_recovery_mixed_ops() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             auto a = t.getByKey("1");
             assert(a.has_value() && a->getFields()[1] == "Alice");  // update undone
             assert(t.getByKey("2").has_value());                    // delete undone
@@ -1618,7 +1782,8 @@ static void test_mvcc_crash_recovery_mixed_ops() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             auto a = t.getByKey("1");
             assert(a.has_value() && a->getFields()[1] == "AliceV2");
             assert(!t.getByKey("2").has_value());
@@ -1656,7 +1821,8 @@ static void test_mvcc_stress_mixed_concurrent() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("stress", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("stress", schema, pm, rm, im, mvcc);
 
             auto ownedKey = [](int i) { return "k" + std::to_string(i); };
             auto newKey = [](int writer, int i) {
@@ -2326,6 +2492,9 @@ int main() {
 
     std::cout << "=== Table ===\n";
     test_table_basic(); test_table_delete(); test_table_insert_mismatch(); test_table_restart();
+
+    std::cout << "=== Database (Phase 6 Session 1: multi-table storage) ===\n";
+    test_database();
 
     std::cout << "=== MVCC (Phase 5) ===\n";
     test_mvcc();

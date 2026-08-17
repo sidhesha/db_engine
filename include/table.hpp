@@ -14,8 +14,18 @@ public:
     // Table used to default-construct an in-memory-only BPlusTree here,
     // which meant every index write silently bypassed all of Phases
     // 1-4's persistence/durability work; this wires it to the real one.
+    //
+    // mvcc is a reference, not an owned member (Phase 6): once multiple
+    // tables can share one TransactionManager/WAL (Database), they must
+    // also share one MVCCManager -- its in-memory transaction status and
+    // snapshot bookkeeping (and the LockManager nested inside it) has to
+    // be visible to every table a connection's transaction touches, not
+    // duplicated per table. Before Phase 6, each Table had its own
+    // isolated TransactionManager anyway, so this was equivalent to
+    // owning one; now the caller (a Database, or a test wiring up a
+    // single table exactly as before) owns it instead.
     Table(const std::string& name, const Schema& schema, PageManager& pm,
-          RecordManager& rm, IndexManager& im);
+          RecordManager& rm, IndexManager& im, MVCCManager& mvcc);
 
     // Multi-statement transactions: begin, do several insert/updateByKey/
     // deleteByKey/getByKey calls passing the returned id as txn_id, then
@@ -67,5 +77,8 @@ private:
     RecordManager& record_manager;
     PageManager& page_manager;
     BPlusTree index;
-    MVCCManager mvcc;
+    // Reference (see the constructor comment): shared across every Table
+    // in the same Database so transaction/snapshot state and row locks
+    // are visible engine-wide, not just within one table.
+    MVCCManager& mvcc;
 };

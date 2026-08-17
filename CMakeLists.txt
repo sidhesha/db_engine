@@ -32,6 +32,7 @@ set(SOURCES
     src/recoverymanager.cpp
     src/mvcc.cpp
     src/lockmanager.cpp
+    src/database.cpp
 )
 
 # Main executable

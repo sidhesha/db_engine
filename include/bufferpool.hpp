@@ -35,7 +35,12 @@ public:
     // (not owned) because a correct WAL spans every store in the engine --
     // IndexManager logs through the same WALWriter/TransactionManager so
     // there's one LSN space and one txn_id space across heap and index.
-    BufferPool(const std::string& filename, WALWriter& wal, TransactionManager& txns);
+    // table_id defaults to 0 (source-compatible with every pre-Phase-6
+    // single-table caller); Database (Phase 6) passes a real, distinct id
+    // per table so its shared WAL/TransactionManager can tell which
+    // table's heap file a given UPDATE record belongs to.
+    BufferPool(const std::string& filename, WALWriter& wal, TransactionManager& txns,
+               uint32_t table_id = 0);
     ~BufferPool();
 
     Page& fetchPage(int page_id);
@@ -56,6 +61,7 @@ private:
 
     WALWriter& wal;
     TransactionManager& txns;
+    uint32_t table_id;
 
     std::vector<BufferFrame> frames;
     int clock_hand;

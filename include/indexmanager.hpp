@@ -10,7 +10,9 @@ public:
     // wal/txns must outlive this IndexManager -- shared with whatever
     // BufferPool the rest of the engine uses, so heap and index writes
     // land in one LSN space / one txn_id space (see bufferpool.hpp).
-    IndexManager(const std::string& index_filename, WALWriter& wal, TransactionManager& txns);
+    // table_id defaults to 0, same rationale as BufferPool's.
+    IndexManager(const std::string& index_filename, WALWriter& wal, TransactionManager& txns,
+                 uint32_t table_id = 0);
     ~IndexManager();
 
     std::shared_ptr<BPlusTreeNode> loadNode(int node_id);
@@ -41,6 +43,7 @@ private:
 
     WALWriter& wal;
     TransactionManager& txns;
+    uint32_t table_id;
 
     void openFile();
     void ensureFileSize(std::size_t size);

@@ -39,9 +39,9 @@ Table::Table(const std::string& name,
              const Schema& schema,
              PageManager& pm,
              RecordManager& rm,
-             IndexManager& im)
-    : name(name), schema(schema), record_manager(rm), page_manager(pm), index(im),
-      mvcc(im.getTransactionManager()) {}
+             IndexManager& im,
+             MVCCManager& mvcc)
+    : name(name), schema(schema), record_manager(rm), page_manager(pm), index(im), mvcc(mvcc) {}
 
 uint64_t Table::beginTxn() { return mvcc.begin(); }
 void Table::commitTxn(uint64_t txn_id) { mvcc.commit(txn_id); }

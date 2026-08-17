@@ -21,8 +21,10 @@ constexpr int32_t ROOT_POINTER_PAGE_ID = -1;
 constexpr std::size_t ROOT_LSN_OFFSET = 12;
 }  // namespace
 
-IndexManager::IndexManager(const std::string& index_filename, WALWriter& wal, TransactionManager& txns)
-    : filename(index_filename), next_node_id(0), root_node_id(-1), wal(wal), txns(txns) {
+IndexManager::IndexManager(const std::string& index_filename, WALWriter& wal, TransactionManager& txns,
+                            uint32_t table_id)
+    : filename(index_filename), next_node_id(0), root_node_id(-1), wal(wal), txns(txns),
+      table_id(table_id) {
     openFile();
     std::vector<char> header = currentHeaderBytes();
     std::memcpy(&root_node_id, header.data(), sizeof(root_node_id));
@@ -132,7 +134,7 @@ void IndexManager::saveNode(const std::shared_ptr<BPlusTreeNode>& node, uint64_t
     }
 
     uint64_t lsn = txns.appendRecord(txn_id, WALRecordType::UPDATE, WALStore::INDEX,
-                                      node->node_id, old_data, new_data);
+                                      node->node_id, old_data, new_data, table_id);
     // WAL rule: the record covering this node's change must be durable
     // before the node itself reaches disk. Unlike BufferPool, IndexManager
     // has no deferred write-back stage to hook this into -- the write
@@ -229,7 +231,7 @@ void IndexManager::setRootNodeID(int id, uint64_t txn_id) {
     std::memcpy(new_header.data(), &new_id, sizeof(new_id));
 
     uint64_t lsn = txns.appendRecord(txn_id, WALRecordType::UPDATE, WALStore::INDEX,
-                                      ROOT_POINTER_PAGE_ID, old_header, new_header);
+                                      ROOT_POINTER_PAGE_ID, old_header, new_header, table_id);
     // WAL rule: durable before the header itself reaches disk.
     wal.flushUpTo(lsn);
     std::memcpy(new_header.data() + ROOT_LSN_OFFSET, &lsn, sizeof(lsn));

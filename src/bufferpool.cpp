@@ -4,8 +4,10 @@
 #include <cstring>
 #include <stdexcept>
 
-BufferPool::BufferPool(const std::string& fname, WALWriter& wal, TransactionManager& txns)
-    : filename(fname), next_page_id(0), wal(wal), txns(txns), frames(NUM_FRAMES), clock_hand(0) {
+BufferPool::BufferPool(const std::string& fname, WALWriter& wal, TransactionManager& txns,
+                       uint32_t table_id)
+    : filename(fname), next_page_id(0), wal(wal), txns(txns), table_id(table_id),
+      frames(NUM_FRAMES), clock_hand(0) {
     openFile();
 
     std::filesystem::path path(filename);
@@ -100,7 +102,7 @@ void BufferPool::logUpdateIfChanged(int idx, int page_id, uint64_t txn_id) {
     bool auto_commit = (txn_id == 0);
     uint64_t active_txn = auto_commit ? txns.begin() : txn_id;
     uint64_t lsn = txns.appendRecord(active_txn, WALRecordType::UPDATE, WALStore::HEAP, page_id,
-                                      frames[idx].before_image, after_image);
+                                      frames[idx].before_image, after_image, table_id);
     if (auto_commit) txns.commit(active_txn);
 
     frames[idx].page->setLSN(lsn);

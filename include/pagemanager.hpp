@@ -7,7 +7,8 @@
 
 class PageManager {
 public:
-    PageManager(const std::string& filename, WALWriter& wal, TransactionManager& txns);
+    PageManager(const std::string& filename, WALWriter& wal, TransactionManager& txns,
+                uint32_t table_id = 0);
     ~PageManager();
 
     Page readPage(int page_id);
