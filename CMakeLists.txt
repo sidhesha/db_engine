@@ -37,6 +37,7 @@ set(SOURCES
     src/parser.cpp
     src/executor.cpp
     src/sqlserver.cpp
+    src/evictionpolicy.cpp
 )
 
 # Main executable
@@ -46,3 +47,10 @@ target_link_libraries(db_engine ws2_32)
 # Test executable
 add_executable(db_engine_test test.cpp ${SOURCES})
 target_link_libraries(db_engine_test ws2_32)
+
+# Benchmark executable. Always built optimized regardless of the active
+# CMAKE_BUILD_TYPE -- a benchmark run against the -O0 debug build the
+# test suite uses would produce meaningless numbers.
+add_executable(db_engine_bench bench.cpp ${SOURCES})
+target_link_libraries(db_engine_bench ws2_32)
+target_compile_options(db_engine_bench PRIVATE -O2)
