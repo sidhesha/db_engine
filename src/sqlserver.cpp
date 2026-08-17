@@ -106,11 +106,24 @@ void SqlServer::start() {
 void SqlServer::stop() {
     if (!running.exchange(false)) return;  // already stopped (or never started)
 
-    // Winsock has no separate "cancel a blocked accept()" call -- closing
-    // the listening socket is what unblocks the accept-loop thread.
+    // acceptLoop() polls `running` at least every ~200ms (see below)
+    // rather than blocking indefinitely in accept(), so this join always
+    // returns promptly on its own -- no separate "cancel a blocked
+    // accept()" trick needed. That matters because there isn't a
+    // portable one: Windows' closesocket() reliably wakes a *different*
+    // thread's blocking call on the same socket, but POSIX leaves that
+    // case unspecified, and on Linux specifically another thread's
+    // accept() often does NOT wake up when the fd is merely closed
+    // elsewhere -- confirmed the hard way, this hung the test suite
+    // indefinitely the first time this port ran in CI on Linux. Only
+    // touching listen_socket here, after the accept thread has fully
+    // joined (and so provably isn't reading it anymore), also avoids a
+    // data race that a "close it to unblock the other thread" approach
+    // would otherwise have on this member.
+    if (accept_thread.joinable()) accept_thread.join();
+
     closesocket(listen_socket);
     listen_socket = INVALID_SOCKET;
-    if (accept_thread.joinable()) accept_thread.join();
 
     std::lock_guard<std::mutex> lock(conn_mu);
     for (auto& t : connection_threads) {
@@ -120,15 +133,31 @@ void SqlServer::stop() {
 }
 
 void SqlServer::acceptLoop() {
+    // Captured once: stable for this thread's whole lifetime by
+    // construction (stop() -- the only thing that ever changes
+    // listen_socket -- only runs after this thread has already started,
+    // per this class's documented start()-then-stop() contract, and only
+    // touches listen_socket again after joining this thread; see stop()).
+    SOCKET fd = listen_socket;
+
     while (running) {
+        // Poll with a short timeout rather than blocking in accept()
+        // indefinitely, so stop() setting `running = false` is always
+        // noticed within one poll interval instead of relying on
+        // unblocking a concurrent blocking call from another thread --
+        // see stop()'s comment for why that isn't portable.
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(fd, &readfds);
+        timeval tv{0, 200000};  // 200ms
+        int ready = select(static_cast<int>(fd) + 1, &readfds, nullptr, nullptr, &tv);
+        if (ready <= 0) continue;  // timeout, or a transient error -- recheck `running`
+
         sockaddr_in client_addr{};
         addrlen_t addr_len = sizeof(client_addr);
-        SOCKET client = accept(listen_socket, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
+        SOCKET client = accept(fd, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
         if (client == INVALID_SOCKET) {
-            // Either a real transient error, or stop() just closed
-            // listen_socket out from under this call -- `running` being
-            // false in that case is what ends the loop, not a retry.
-            continue;
+            continue;  // transient -- select() said readable but accept() still failed
         }
 
         std::lock_guard<std::mutex> lock(conn_mu);
