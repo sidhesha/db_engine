@@ -26,6 +26,7 @@
 #include "database.hpp"
 #include "lexer.hpp"
 #include "parser.hpp"
+#include "executor.hpp"
 
 static int passed = 0;
 static int failed = 0;
@@ -1421,9 +1422,126 @@ static void test_sql_parser() {
     } END_TEST;
 }
 
+// ─── SQL Executor (Phase 6 Session 3) ─────────────────────────────────────────
+
+// Lexes, parses, and executes one statement in one call -- the tests
+// below only care about the resulting QueryResult, not the intermediate
+// token stream or AST (those are covered separately above).
+static QueryResult run(Database& db, uint64_t& txn, const std::string& sql) {
+    Lexer lexer(sql);
+    Parser parser(lexer.tokenize());
+    Stmt stmt = parser.parseStatement();
+    return execute(stmt, db, txn);
+}
+
+static void test_sql_executor_crud() {
+    const std::string dir = "sql_executor_crud";
+    std::filesystem::remove_all(dir);
+
+    TEST("CREATE TABLE, INSERT, SELECT (both '*' and a projection, both PK and scan WHERE), UPDATE, DELETE all work end to end") {
+        Database db(dir);
+        uint64_t txn = 0;
+
+        auto created = run(db, txn, "CREATE TABLE users (id string PRIMARY KEY, name string, age int);");
+        assert(created.ok);
+
+        assert(run(db, txn, "INSERT INTO users VALUES ('1', 'Alice', 30);").ok);
+        assert(run(db, txn, "INSERT INTO users VALUES ('2', 'Bob', 25);").ok);
+        assert(run(db, txn, "INSERT INTO users VALUES ('3', 'Carol', 40);").ok);
+
+        auto all = run(db, txn, "SELECT * FROM users;");
+        assert(all.ok);
+        assert(all.columns == std::vector<std::string>({"id", "name", "age"}));
+        assert(all.rows.size() == 3);
+
+        auto by_pk = run(db, txn, "SELECT name FROM users WHERE id = '2';");
+        assert(by_pk.ok && by_pk.columns == std::vector<std::string>({"name"}));
+        assert(by_pk.rows.size() == 1 && by_pk.rows[0][0] == "Bob");
+
+        auto by_scan = run(db, txn, "SELECT id FROM users WHERE name = 'Carol';");
+        assert(by_scan.ok && by_scan.rows.size() == 1 && by_scan.rows[0][0] == "3");
+
+        auto upd = run(db, txn, "UPDATE users SET age = 26 WHERE id = '2';");
+        assert(upd.ok && upd.affected_rows == 1);
+        auto after_upd = run(db, txn, "SELECT age FROM users WHERE id = '2';");
+        assert(after_upd.rows[0][0] == "26");
+
+        auto del = run(db, txn, "DELETE FROM users WHERE id = '1';");
+        assert(del.ok && del.affected_rows == 1);
+        auto after_del = run(db, txn, "SELECT * FROM users;");
+        assert(after_del.rows.size() == 2);
+    } END_TEST;
+
+    std::filesystem::remove_all(dir);
+}
+
+static void test_sql_executor_typed_where() {
+    const std::string dir = "sql_executor_typed_where";
+    std::filesystem::remove_all(dir);
+
+    TEST("a scanned WHERE on an int column compares numerically, not lexicographically") {
+        Database db(dir);
+        uint64_t txn = 0;
+        run(db, txn, "CREATE TABLE t (id string PRIMARY KEY, age int);");
+        run(db, txn, "INSERT INTO t VALUES ('a', 9);");
+        run(db, txn, "INSERT INTO t VALUES ('b', 10);");
+
+        // Lexicographically, "10" < "9" (since '1' < '9'), so a naive
+        // string compare of `age > 9` would wrongly return nothing.
+        // Numerically, only age=10 qualifies.
+        auto r = run(db, txn, "SELECT id FROM t WHERE age > 9;");
+        assert(r.ok && r.rows.size() == 1 && r.rows[0][0] == "b");
+    } END_TEST;
+
+    std::filesystem::remove_all(dir);
+}
+
+static void test_sql_executor_transactions() {
+    const std::string dir = "sql_executor_txn";
+    std::filesystem::remove_all(dir);
+
+    TEST("BEGIN groups multiple statements; ROLLBACK undoes all of them, COMMIT keeps all of them") {
+        Database db(dir);
+        uint64_t txn = 0;
+        run(db, txn, "CREATE TABLE t (id string PRIMARY KEY);");
+
+        assert(run(db, txn, "BEGIN;").ok);
+        assert(txn != 0);
+        run(db, txn, "INSERT INTO t VALUES ('1');");
+        run(db, txn, "INSERT INTO t VALUES ('2');");
+        assert(run(db, txn, "ROLLBACK;").ok);
+        assert(txn == 0);
+        assert(run(db, txn, "SELECT * FROM t;").rows.empty());
+
+        assert(run(db, txn, "BEGIN;").ok);
+        run(db, txn, "INSERT INTO t VALUES ('1');");
+        run(db, txn, "INSERT INTO t VALUES ('2');");
+        assert(run(db, txn, "COMMIT;").ok);
+        assert(txn == 0);
+        assert(run(db, txn, "SELECT * FROM t;").rows.size() == 2);
+    } END_TEST;
+
+    TEST("COMMIT/ROLLBACK with nothing open, or a nested BEGIN, are clean protocol errors") {
+        Database db(dir + "_protocol");
+        uint64_t txn = 0;
+        assert(!run(db, txn, "COMMIT;").ok);
+        assert(!run(db, txn, "ROLLBACK;").ok);
+
+        assert(run(db, txn, "BEGIN;").ok);
+        assert(!run(db, txn, "BEGIN;").ok);  // already one open
+        assert(run(db, txn, "ROLLBACK;").ok);  // cleanup
+    } END_TEST;
+
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(dir + "_protocol");
+}
+
 static void test_sql() {
     test_sql_lexer();
     test_sql_parser();
+    test_sql_executor_crud();
+    test_sql_executor_typed_where();
+    test_sql_executor_transactions();
 }
 
 // ─── MVCC (Phase 5) ────────────────────────────────────────────────────────
@@ -2667,7 +2785,7 @@ int main() {
     std::cout << "=== Database (Phase 6 Session 1: multi-table storage) ===\n";
     test_database();
 
-    std::cout << "=== SQL Lexer + Parser (Phase 6 Session 2) ===\n";
+    std::cout << "=== SQL Frontend (Phase 6) ===\n";
     test_sql();
 
     std::cout << "=== MVCC (Phase 5) ===\n";

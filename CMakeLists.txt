@@ -35,6 +35,7 @@ set(SOURCES
     src/database.cpp
     src/lexer.cpp
     src/parser.cpp
+    src/executor.cpp
 )
 
 # Main executable

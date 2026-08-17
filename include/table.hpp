@@ -6,6 +6,7 @@
 #include "recordmanager.hpp"
 #include "indexmanager.hpp"
 #include "mvcc.hpp"
+#include "key.hpp"
 
 class Table {
 public:
@@ -61,6 +62,14 @@ public:
     // visible to txn_id's snapshot (see MVCCManager::isVisible), or falls
     // off the end of the chain.
     std::optional<Record> getByKey(const std::string& key, uint64_t txn_id = 0);
+    // Full-table scan (Phase 6: SQL SELECT/UPDATE/DELETE with a WHERE
+    // condition on a non-primary-key column has no index to use, so it
+    // needs every visible row). One entry per key currently in the
+    // index, using the exact same version-chain walk getByKey does (see
+    // findVisibleVersion) -- a key whose current version isn't visible to
+    // txn_id's snapshot is simply omitted, not returned as a "deleted"
+    // marker.
+    std::vector<std::pair<Key, Record>> scanAll(uint64_t txn_id = 0);
 
     const std::string& getName() const;
     const Schema& getSchema() const;
@@ -81,4 +90,9 @@ private:
     // in the same Database so transaction/snapshot state and row locks
     // are visible engine-wide, not just within one table.
     MVCCManager& mvcc;
+
+    // Shared by getByKey() and scanAll(): walks the version chain
+    // starting at start_rid until it finds a version isVisible() to
+    // txn_id under `snapshot`, or falls off the end.
+    std::optional<Record> findVisibleVersion(RID start_rid, uint64_t txn_id, const Snapshot& snapshot);
 };
