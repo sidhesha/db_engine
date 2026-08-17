@@ -97,18 +97,21 @@ No shortcuts — each concept mirrors how a real database (PostgreSQL/InnoDB) wo
 
 ---
 
-## Phase 6: SQL Frontend (≈ 4-5 sessions)
+## ✅ Phase 6: SQL Frontend (COMPLETE)
 **What:** Accept SQL over TCP and execute it.
 **Why:** This is the "oh you built a database" moment.
 
-**Plan:**
-- Simple recursive-descent parser: `SELECT/INSERT/CREATE TABLE/DELETE` with WHERE clause (single condition)
-- AST → query plan
-- Execution: bind to `Table` API, filter rows, project columns
-- Wire protocol: simple `\n`-delimited text over TCP (no need for PostgreSQL wire protocol)
-- Single-threaded at first, then add connection pool
+**Done:**
+- Found and fixed a prerequisite gap before any of this could work, the same shape as Phase 4/5's: `CatalogManager` only tracked `Schema` objects, not physical storage — `PageManager`/`IndexManager` each hardcoded one filename, so there was no way to turn a table *name* into a working `Table` backed by its own files, and `WALRecord` had no notion of "which table" (`store` alone was only ever unambiguous with exactly one heap file and one index file in the whole process)
+- Every `WALRecord` now carries a `table_id` (a trailing default-0 parameter threaded through `TransactionManager::appendRecord`/`BufferPool`/`PageManager`/`IndexManager`, so every pre-Phase-6 single-table call site needed zero changes); `RecoveryManager` dispatches redo/undo by `(table_id, store)` against a table_id-keyed file map, with a single-table convenience constructor preserved for the existing Phase 3/4/5 recovery tests; `CatalogManager` assigns and persists a monotonic `table_id` per table alongside its `Schema`
+- New `Database` (`include/database.hpp`/`src/database.cpp`) owns one shared `WALWriter`/`TransactionManager`/`MVCCManager`/`CatalogManager` and one `PageManager`+`RecordManager`+`IndexManager`+`Table` per catalog table — real Postgres design (one WAL, one LSN/txn_id space, for the whole database), chosen explicitly over a simpler per-table-WAL alternative so a transaction spanning multiple tables stays atomic. `MVCCManager` moved from an owned `Table` member to an injected reference for the same reason: multiple tables sharing one `TransactionManager` have to share one `MVCCManager` too, or a `BEGIN` on one table's connection would be invisible to a second table's visibility checks
+- New hand-rolled `Lexer`/`Parser` (`include/lexer.hpp`, `include/parser.hpp`) — recursive-descent over `CREATE TABLE/INSERT/SELECT/DELETE/UPDATE/BEGIN/COMMIT/ROLLBACK`, single-condition `WHERE` (no `AND`/`OR`/joins/subqueries, matching this phase's stated scope), throwing a position-annotated error on malformed input rather than crashing. Hit and fixed a genuine MinGW/Winsock landmine: `enum class TokenType` collided with `winnt.h`'s `TOKEN_INFORMATION_CLASS::TokenType` enumerator the moment `<winsock2.h>` entered a translation unit — renamed to `SqlTokenType`
+- New `execute()` (`include/executor.hpp`/`src/executor.cpp`) binds the AST to the `Table` API and never throws — every failure comes back as `QueryResult{ok=false, message}`. `Table` gained `scanAll()` for `WHERE` conditions that aren't a primary-key equality (no index to use), sharing its version-chain walk with `getByKey()` via an extracted `findVisibleVersion()` helper. A scanned `WHERE` on an `int` column compares numerically via the column's declared `Schema` type, not lexicographically
+- New `SqlServer` (`include/sqlserver.hpp`/`src/sqlserver.cpp`): a Winsock2 TCP server, one thread per connection rather than the single-threaded accept-loop this phase's plan originally sketched before Phase 5 existed — `Database`/`Table`/`MVCCManager`/`LockManager` are already safe under concurrent callers by construction, so serving connections concurrently is what actually lets a write-write conflict block and resolve, or a `BEGIN`-held snapshot stay repeatable-read, *through SQL* rather than only at the `Table` API directly
+- `main.cpp` is now the real entry point: opens/creates a `Database`, starts `SqlServer` on port 5433, and blocks until `quit` is typed
+- 33 new tests (145 → 178): multi-table storage surviving a restart and a cross-table crash undone atomically; lexer/parser coverage for every token and statement kind plus malformed-input error paths; full CRUD and typed-`WHERE` correctness through the executor; full CRUD, multi-statement-per-packet framing, and `BEGIN`/`COMMIT` session state over a real socket; a write-write conflict between two live SQL connections blocking and resolving; a `BEGIN`-held connection's repeatable-read snapshot seeing no phantoms from a concurrent connection's committed insert; and `CREATE TABLE` + data on two tables, issued entirely via SQL, surviving a process restart
 
-**Systems concept taught:** Parsing, query planning, iterator model, client-server architecture.
+**Systems concept taught:** Parsing, query planning, iterator model, client-server architecture, multi-table WAL design.
 
 ---
 
@@ -150,5 +153,5 @@ Each phase builds a sentence you can say in an interview. No fluff.
 | 3 — B-Tree Concurrency (Latch Crabbing + B-link) | ✅ Done |
 | 4 — Write-Ahead Log | ✅ Done |
 | 5 — MVCC Transactions | ✅ Done |
-| 6 — SQL Frontend | 🔜 Next |
-| 7 — Benchmarking & Polish | ⏳ |
+| 6 — SQL Frontend | ✅ Done |
+| 7 — Benchmarking & Polish | 🔜 Next |

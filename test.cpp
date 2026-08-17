@@ -1555,20 +1555,27 @@ static SOCKET sqlConnect(uint16_t port) {
 // passes with nothing more arriving -- the wire protocol has no
 // length-prefix framing, so this is how a test client (which, unlike the
 // server, knows exactly how many statements it just sent) tells "the
-// full response landed" apart from "still arriving".
+// full response landed" apart from "still arriving". Waits indefinitely
+// (up to a long safety ceiling) for the *first* byte -- a statement
+// blocked on a row lock can legitimately take a while before any
+// response starts arriving at all, which is exactly what the write-write
+// conflict test below deliberately exercises -- then switches to a short
+// idle timeout once bytes are flowing, to detect the response's end.
 static std::string sqlRecvResponse(SOCKET s) {
     std::string result;
     char buf[4096];
+    bool got_any = false;
     while (true) {
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(s, &readfds);
-        timeval tv{0, 50000};  // 50ms
+        timeval tv = got_any ? timeval{0, 50000} : timeval{30, 0};  // 50ms once flowing, else 30s ceiling
         int rc = select(0, &readfds, nullptr, nullptr, &tv);
         if (rc <= 0) break;
         int n = recv(s, buf, sizeof(buf), 0);
         if (n <= 0) break;
         result.append(buf, n);
+        got_any = true;
     }
     return result;
 }
@@ -1643,6 +1650,127 @@ static void test_sql_server_basic() {
     std::filesystem::remove_all(dir);
 }
 
+// ─── SQL Server integration + crash recovery (Phase 6 Session 5) ─────────────
+
+static void test_sql_server_write_write_conflict() {
+    const std::string dir = "sql_server_conflict";
+    std::filesystem::remove_all(dir);
+    const uint16_t port = 15502;
+    {
+    Database db(dir);
+    SqlServer server(db, port);
+    server.start();
+
+    TEST("a write-write conflict between two real SQL connections blocks the second until the first commits, then it chains onto the committed result") {
+        SOCKET a = sqlConnect(port);
+        SOCKET b = sqlConnect(port);
+
+        assert(sqlSendAndRecv(a, "CREATE TABLE t (id string PRIMARY KEY, val string);") == "OK\n");
+        assert(sqlSendAndRecv(a, "INSERT INTO t VALUES ('1', 'orig');") == "OK 1 rows affected\n");
+
+        assert(sqlSendAndRecv(a, "BEGIN;") == "OK\n");
+        assert(sqlSendAndRecv(a, "UPDATE t SET val = 'FromA' WHERE id = '1';") ==
+               "OK 1 rows affected\n");
+        // Connection A now holds the row lock, uncommitted.
+
+        std::atomic<bool> b_done{false};
+        std::string b_response;
+        std::thread writer_b([&] {
+            b_response = sqlSendAndRecv(b, "UPDATE t SET val = 'FromB' WHERE id = '1';");
+            b_done = true;
+        });
+
+        // Give B's request time to actually be received by its
+        // connection thread and block on the row lock, not just "not yet
+        // sent" -- same discipline test_mvcc_lock_integration uses at the
+        // Table API level, just with sockets in between now.
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        assert(!b_done);  // genuinely blocked on A, not racing a stale read
+
+        assert(sqlSendAndRecv(a, "COMMIT;") == "OK\n");
+        writer_b.join();
+        assert(b_done);
+        assert(b_response == "OK 1 rows affected\n");
+
+        assert(sqlSendAndRecv(a, "SELECT val FROM t WHERE id = '1';") == "val\nFromB\nOK 1 rows\n");
+
+        closesocket(a);
+        closesocket(b);
+    } END_TEST;
+
+    server.stop();
+    }
+    std::filesystem::remove_all(dir);
+}
+
+static void test_sql_server_repeatable_read() {
+    const std::string dir = "sql_server_repeatable_read";
+    std::filesystem::remove_all(dir);
+    const uint16_t port = 15503;
+    {
+    Database db(dir);
+    SqlServer server(db, port);
+    server.start();
+
+    TEST("a BEGIN-held connection's snapshot sees no phantoms from a concurrent connection's committed insert, until it commits and re-queries") {
+        SOCKET a = sqlConnect(port);
+        SOCKET b = sqlConnect(port);
+
+        assert(sqlSendAndRecv(a, "CREATE TABLE t (id string PRIMARY KEY, val string);") == "OK\n");
+        assert(sqlSendAndRecv(a, "INSERT INTO t VALUES ('1', 'x');") == "OK 1 rows affected\n");
+
+        assert(sqlSendAndRecv(a, "BEGIN;") == "OK\n");
+        assert(sqlSendAndRecv(a, "SELECT * FROM t;") == "id|val\n1|x\nOK 1 rows\n");  // takes A's snapshot
+
+        // A separate, auto-commit connection inserts and commits a new
+        // row entirely outside A's still-open transaction.
+        assert(sqlSendAndRecv(b, "INSERT INTO t VALUES ('2', 'y');") == "OK 1 rows affected\n");
+
+        // Still within A's original transaction: repeatable read means
+        // the new row must stay invisible even though it's since
+        // committed -- A's snapshot never moves.
+        assert(sqlSendAndRecv(a, "SELECT * FROM t;") == "id|val\n1|x\nOK 1 rows\n");
+
+        assert(sqlSendAndRecv(a, "COMMIT;") == "OK\n");
+        // A fresh (auto-commit) statement on the same connection takes a
+        // brand-new snapshot and does see it.
+        assert(sqlSendAndRecv(a, "SELECT * FROM t;") == "id|val\n1|x\n2|y\nOK 2 rows\n");
+
+        closesocket(a);
+        closesocket(b);
+    } END_TEST;
+
+    server.stop();
+    }
+    std::filesystem::remove_all(dir);
+}
+
+static void test_sql_crash_recovery() {
+    const std::string dir = "sql_crash_recovery";
+    std::filesystem::remove_all(dir);
+
+    TEST("CREATE TABLE + data on two tables, all issued via SQL, survives a process restart") {
+        {
+            Database db(dir);
+            uint64_t txn = 0;
+            assert(run(db, txn, "CREATE TABLE users (id string PRIMARY KEY, name string);").ok);
+            assert(run(db, txn, "CREATE TABLE products (sku string PRIMARY KEY, price int);").ok);
+            assert(run(db, txn, "INSERT INTO users VALUES ('1', 'Alice');").ok);
+            assert(run(db, txn, "INSERT INTO products VALUES ('a1', 100);").ok);
+        }  // Database destructed -- simulates a clean process exit
+        {
+            Database db(dir);  // recovery runs here, in the constructor
+            uint64_t txn = 0;
+            auto users = run(db, txn, "SELECT * FROM users;");
+            assert(users.ok && users.rows.size() == 1 && users.rows[0][1] == "Alice");
+            auto products = run(db, txn, "SELECT * FROM products;");
+            assert(products.ok && products.rows.size() == 1 && products.rows[0][1] == "100");
+        }
+    } END_TEST;
+
+    std::filesystem::remove_all(dir);
+}
+
 static void test_sql() {
     test_sql_lexer();
     test_sql_parser();
@@ -1650,6 +1778,9 @@ static void test_sql() {
     test_sql_executor_typed_where();
     test_sql_executor_transactions();
     test_sql_server_basic();
+    test_sql_server_write_write_conflict();
+    test_sql_server_repeatable_read();
+    test_sql_crash_recovery();
 }
 
 // ─── MVCC (Phase 5) ────────────────────────────────────────────────────────
