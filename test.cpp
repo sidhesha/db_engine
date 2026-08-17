@@ -24,6 +24,8 @@
 #include "lockmanager.hpp"
 #include "mvcc.hpp"
 #include "database.hpp"
+#include "lexer.hpp"
+#include "parser.hpp"
 
 static int passed = 0;
 static int failed = 0;
@@ -1253,6 +1255,175 @@ static void test_database() {
     test_database_two_tables_survive_restart();
     test_database_crash_spanning_two_tables_undone_atomically();
     test_recovery_multitable_routing();
+}
+
+// ─── SQL Lexer + Parser (Phase 6 Session 2) ───────────────────────────────────
+
+static std::vector<Token> lex(const std::string& sql) {
+    Lexer lexer(sql);
+    return lexer.tokenize();
+}
+
+static void test_sql_lexer() {
+    TEST("keywords, identifiers, punctuation tokenize correctly and case-insensitively") {
+        auto tokens = lex("select * From users;");
+        assert(tokens.size() == 6);  // 5 tokens + END_OF_INPUT
+        assert(tokens[0].type == TokenType::KEYWORD_SELECT);
+        assert(tokens[1].type == TokenType::STAR);
+        assert(tokens[2].type == TokenType::KEYWORD_FROM);
+        assert(tokens[3].type == TokenType::IDENTIFIER && tokens[3].text == "users");
+        assert(tokens[4].type == TokenType::SEMICOLON);
+        assert(tokens[5].type == TokenType::END_OF_INPUT);
+    } END_TEST;
+
+    TEST("identifier text preserves original case, unlike keywords") {
+        auto tokens = lex("SELECT UserName FROM t;");
+        assert(tokens[1].type == TokenType::IDENTIFIER && tokens[1].text == "UserName");
+    } END_TEST;
+
+    TEST("string literal, including an escaped '' quote") {
+        auto tokens = lex("'it''s here'");
+        assert(tokens[0].type == TokenType::STRING_LITERAL);
+        assert(tokens[0].text == "it's here");
+    } END_TEST;
+
+    TEST("number literal, including a negative one") {
+        auto tokens = lex("42 -7");
+        assert(tokens[0].type == TokenType::NUMBER_LITERAL && tokens[0].text == "42");
+        assert(tokens[1].type == TokenType::NUMBER_LITERAL && tokens[1].text == "-7");
+    } END_TEST;
+
+    TEST("all comparison operators, including <> as an alias for !=") {
+        auto tokens = lex("= != < <= > >= <>");
+        std::vector<TokenType> expected = {
+            TokenType::OP_EQ, TokenType::OP_NEQ, TokenType::OP_LT, TokenType::OP_LTE,
+            TokenType::OP_GT, TokenType::OP_GTE, TokenType::OP_NEQ,
+        };
+        for (std::size_t i = 0; i < expected.size(); i++) assert(tokens[i].type == expected[i]);
+    } END_TEST;
+
+    TEST("a `-- ...` line comment is skipped entirely") {
+        auto tokens = lex("SELECT 1; -- trailing comment\n");
+        assert(tokens.back().type == TokenType::END_OF_INPUT);
+        // no stray tokens from the comment text itself
+        for (auto& t : tokens) assert(t.text.find("trailing") == std::string::npos);
+    } END_TEST;
+
+    TEST("unterminated string literal throws LexError, not a crash") {
+        bool caught = false;
+        try { lex("'never closed"); } catch (const LexError&) { caught = true; }
+        assert(caught);
+    } END_TEST;
+
+    TEST("a lone '!' not followed by '=' throws LexError") {
+        bool caught = false;
+        try { lex("!"); } catch (const LexError&) { caught = true; }
+        assert(caught);
+    } END_TEST;
+
+    TEST("an unrecognized character throws LexError") {
+        bool caught = false;
+        try { lex("@"); } catch (const LexError&) { caught = true; }
+        assert(caught);
+    } END_TEST;
+}
+
+static Stmt parseOne(const std::string& sql) {
+    Parser parser(lex(sql));
+    return parser.parseStatement();
+}
+
+static void test_sql_parser() {
+    TEST("CREATE TABLE with an inert PRIMARY KEY marker on the first column") {
+        auto stmt = parseOne("CREATE TABLE users (id int PRIMARY KEY, name string);");
+        auto& create = std::get<CreateTableStmt>(stmt);
+        assert(create.table_name == "users");
+        assert(create.columns.size() == 2);
+        assert(create.columns[0].name == "id" && create.columns[0].type == "int");
+        assert(create.columns[0].primary_key);
+        assert(create.columns[1].name == "name" && create.columns[1].type == "string");
+        assert(!create.columns[1].primary_key);
+    } END_TEST;
+
+    TEST("PRIMARY KEY on a column other than the first is a parse error") {
+        bool caught = false;
+        try { parseOne("CREATE TABLE t (a int, b int PRIMARY KEY);"); }
+        catch (const ParseError&) { caught = true; }
+        assert(caught);
+    } END_TEST;
+
+    TEST("INSERT INTO ... VALUES parses positional literals in order") {
+        auto stmt = parseOne("INSERT INTO users VALUES ('1', 'Alice');");
+        auto& insert = std::get<InsertStmt>(stmt);
+        assert(insert.table_name == "users");
+        assert(insert.values == std::vector<std::string>({"1", "Alice"}));
+    } END_TEST;
+
+    TEST("SELECT * FROM parses to an empty (meaning 'all columns') projection list") {
+        auto stmt = parseOne("SELECT * FROM users;");
+        auto& select = std::get<SelectStmt>(stmt);
+        assert(select.table_name == "users");
+        assert(select.columns.empty());
+        assert(!select.where.has_value());
+    } END_TEST;
+
+    TEST("SELECT with an explicit column list and a typed WHERE condition") {
+        auto stmt = parseOne("SELECT id, name FROM users WHERE id = 5;");
+        auto& select = std::get<SelectStmt>(stmt);
+        assert(select.columns == std::vector<std::string>({"id", "name"}));
+        assert(select.where.has_value());
+        assert(select.where->column == "id");
+        assert(select.where->op == ComparisonOp::EQ);
+        assert(select.where->literal == "5");
+    } END_TEST;
+
+    TEST("DELETE FROM ... WHERE with a string literal and a non-equality operator") {
+        auto stmt = parseOne("DELETE FROM users WHERE name != 'Bob';");
+        auto& del = std::get<DeleteStmt>(stmt);
+        assert(del.table_name == "users");
+        assert(del.where.has_value());
+        assert(del.where->op == ComparisonOp::NEQ);
+        assert(del.where->literal == "Bob");
+    } END_TEST;
+
+    TEST("UPDATE ... SET with multiple assignments and a WHERE clause") {
+        auto stmt = parseOne("UPDATE users SET name = 'Alice2', age = 31 WHERE id = '1';");
+        auto& update = std::get<UpdateStmt>(stmt);
+        assert(update.table_name == "users");
+        assert(update.assignments.size() == 2);
+        assert(update.assignments[0].column == "name" && update.assignments[0].value == "Alice2");
+        assert(update.assignments[1].column == "age" && update.assignments[1].value == "31");
+        assert(update.where.has_value() && update.where->column == "id");
+    } END_TEST;
+
+    TEST("BEGIN / COMMIT / ROLLBACK parse to their own statement types") {
+        assert(std::holds_alternative<BeginStmt>(parseOne("BEGIN;")));
+        assert(std::holds_alternative<CommitStmt>(parseOne("COMMIT;")));
+        assert(std::holds_alternative<RollbackStmt>(parseOne("ROLLBACK;")));
+    } END_TEST;
+
+    TEST("a statement missing its trailing ';' is a clean parse error, not a crash") {
+        bool caught = false;
+        try { parseOne("SELECT * FROM users"); } catch (const ParseError&) { caught = true; }
+        assert(caught);
+    } END_TEST;
+
+    TEST("unbalanced parentheses in INSERT VALUES is a clean parse error") {
+        bool caught = false;
+        try { parseOne("INSERT INTO t VALUES ('1', '2';"); } catch (const ParseError&) { caught = true; }
+        assert(caught);
+    } END_TEST;
+
+    TEST("a missing FROM in SELECT is a clean parse error") {
+        bool caught = false;
+        try { parseOne("SELECT * users;"); } catch (const ParseError&) { caught = true; }
+        assert(caught);
+    } END_TEST;
+}
+
+static void test_sql() {
+    test_sql_lexer();
+    test_sql_parser();
 }
 
 // ─── MVCC (Phase 5) ────────────────────────────────────────────────────────
@@ -2495,6 +2666,9 @@ int main() {
 
     std::cout << "=== Database (Phase 6 Session 1: multi-table storage) ===\n";
     test_database();
+
+    std::cout << "=== SQL Lexer + Parser (Phase 6 Session 2) ===\n";
+    test_sql();
 
     std::cout << "=== MVCC (Phase 5) ===\n";
     test_mvcc();

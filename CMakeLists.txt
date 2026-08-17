@@ -33,6 +33,8 @@ set(SOURCES
     src/mvcc.cpp
     src/lockmanager.cpp
     src/database.cpp
+    src/lexer.cpp
+    src/parser.cpp
 )
 
 # Main executable
