@@ -5,9 +5,9 @@
 #include <stdexcept>
 
 BufferPool::BufferPool(const std::string& fname, WALWriter& wal, TransactionManager& txns,
-                       uint32_t table_id)
+                       uint32_t table_id, std::unique_ptr<EvictionPolicy> policy)
     : filename(fname), next_page_id(0), wal(wal), txns(txns), table_id(table_id),
-      frames(NUM_FRAMES), clock_hand(0) {
+      frames(NUM_FRAMES), policy(std::move(policy)) {
     openFile();
 
     std::filesystem::path path(filename);
@@ -51,7 +51,7 @@ Page& BufferPool::fetchPage(int page_id) {
     int idx = findFrame(page_id);
     if (idx != -1) {
         frames[idx].pin_count++;
-        frames[idx].ref_bit = true;
+        policy->recordAccess(idx);
         captureBeforeImage(idx);
         return *frames[idx].page;
     }
@@ -59,7 +59,7 @@ Page& BufferPool::fetchPage(int page_id) {
     idx = evictFrame();
     readPageFromDisk(idx, page_id);
     frames[idx].pin_count = 1;
-    frames[idx].ref_bit = true;
+    policy->recordAccess(idx);
     captureBeforeImage(idx);
     return *frames[idx].page;
 }
@@ -117,7 +117,7 @@ int BufferPool::allocatePage() {
     frames[idx].page_id = page_id;
     frames[idx].dirty = true;
     frames[idx].pin_count = 0;
-    frames[idx].ref_bit = false;
+    policy->reset(idx);
     // Snapshot the fresh empty page as the before-image: if the caller
     // mutates it before write-back, unpinPage(dirty=true) can then log a
     // real UPDATE (old = empty page, new = populated page), which is
@@ -152,51 +152,21 @@ int BufferPool::findFrame(int page_id) const {
 }
 
 int BufferPool::evictFrame() {
-    int attempts = 0;
-    while (attempts < NUM_FRAMES * 2) {
-        BufferFrame& frame = frames[clock_hand];
-
-        if (frame.pin_count > 0) {
-            clock_hand = (clock_hand + 1) % NUM_FRAMES;
-            attempts++;
-            continue;
-        }
-
-        if (frame.ref_bit) {
-            frame.ref_bit = false;
-            clock_hand = (clock_hand + 1) % NUM_FRAMES;
-            attempts++;
-            continue;
-        }
-
-        if (frame.page) {
-            if (frame.dirty) {
-                writePageToDisk(clock_hand);
-                frame.dirty = false;
-            }
-            frame.page.reset();
-            frame.page_id = -1;
-        }
-
-        int evicted_idx = clock_hand;
-        clock_hand = (clock_hand + 1) % NUM_FRAMES;
-        return evicted_idx;
+    int idx = policy->selectVictim(frames);
+    if (idx < 0) {
+        throw std::runtime_error("BufferPool: all frames are pinned, cannot evict");
     }
 
-    for (int i = 0; i < NUM_FRAMES; i++) {
-        BufferFrame& frame = frames[i];
-        if (frame.pin_count == 0 && frame.page) {
-            if (frame.dirty) {
-                writePageToDisk(i);
-                frame.dirty = false;
-            }
-            frame.page.reset();
-            frame.page_id = -1;
-            return i;
+    BufferFrame& frame = frames[idx];
+    if (frame.page) {
+        if (frame.dirty) {
+            writePageToDisk(idx);
+            frame.dirty = false;
         }
+        frame.page.reset();
+        frame.page_id = -1;
     }
-
-    throw std::runtime_error("BufferPool: all frames are pinned, cannot evict");
+    return idx;
 }
 
 void BufferPool::readPageFromDisk(int frame_idx, int page_id) {

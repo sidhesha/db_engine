@@ -37,6 +37,7 @@ set(SOURCES
     src/parser.cpp
     src/executor.cpp
     src/sqlserver.cpp
+    src/evictionpolicy.cpp
 )
 
 # Main executable

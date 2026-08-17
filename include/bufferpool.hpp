@@ -2,6 +2,7 @@
 
 #include "page.hpp"
 #include "wal.hpp"
+#include "evictionpolicy.hpp"
 #include <string>
 #include <vector>
 #include <fstream>
@@ -12,7 +13,6 @@ struct BufferFrame {
     int page_id;
     bool dirty;
     int pin_count;
-    bool ref_bit;
 
     // Snapshot of this page's bytes as of the most recent fetchPage()
     // since it was last logged/clean -- the WAL "before image" for
@@ -24,7 +24,7 @@ struct BufferFrame {
     std::vector<char> before_image;
     bool before_image_valid;
 
-    BufferFrame() : page(nullptr), page_id(-1), dirty(false), pin_count(0), ref_bit(false), before_image_valid(false) {}
+    BufferFrame() : page(nullptr), page_id(-1), dirty(false), pin_count(0), before_image_valid(false) {}
 };
 
 class BufferPool {
@@ -39,8 +39,13 @@ public:
     // single-table caller); Database (Phase 6) passes a real, distinct id
     // per table so its shared WAL/TransactionManager can tell which
     // table's heap file a given UPDATE record belongs to.
+    // policy defaults to ClockSweepPolicy (source-compatible with every
+    // pre-Phase-7 caller) -- Phase 7's eviction-policy shootout
+    // constructs a BufferPool with LRU2Policy instead to compare the two
+    // head to head.
     BufferPool(const std::string& filename, WALWriter& wal, TransactionManager& txns,
-               uint32_t table_id = 0);
+               uint32_t table_id = 0,
+               std::unique_ptr<EvictionPolicy> policy = std::make_unique<ClockSweepPolicy>());
     ~BufferPool();
 
     Page& fetchPage(int page_id);
@@ -64,7 +69,7 @@ private:
     uint32_t table_id;
 
     std::vector<BufferFrame> frames;
-    int clock_hand;
+    std::unique_ptr<EvictionPolicy> policy;
 
     void openFile();
     void ensureFileSize(std::size_t size);
