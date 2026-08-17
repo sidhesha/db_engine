@@ -62,7 +62,7 @@ Page& BufferPool::fetchPage(int page_id) {
     return *frames[idx].page;
 }
 
-void BufferPool::unpinPage(int page_id, bool dirty) {
+void BufferPool::unpinPage(int page_id, bool dirty, uint64_t txn_id) {
     int idx = findFrame(page_id);
     if (idx == -1) {
         throw std::runtime_error("unpinPage: page " + std::to_string(page_id) + " not in buffer pool");
@@ -71,7 +71,7 @@ void BufferPool::unpinPage(int page_id, bool dirty) {
         frames[idx].pin_count--;
     }
     if (dirty) {
-        logUpdateIfChanged(idx, page_id);
+        logUpdateIfChanged(idx, page_id, txn_id);
         frames[idx].dirty = true;
     }
 }
@@ -83,7 +83,7 @@ void BufferPool::captureBeforeImage(int idx) {
     }
 }
 
-void BufferPool::logUpdateIfChanged(int idx, int page_id) {
+void BufferPool::logUpdateIfChanged(int idx, int page_id, uint64_t txn_id) {
     // Defensive: every fetchPage() captures a before-image, but guard
     // against calling unpinPage(dirty=true) on a page that was never
     // fetched through this BufferPool instance's normal path.
@@ -97,10 +97,11 @@ void BufferPool::logUpdateIfChanged(int idx, int page_id) {
         return;
     }
 
-    uint64_t txn_id = txns.begin();
-    uint64_t lsn = txns.appendRecord(txn_id, WALRecordType::UPDATE, WALStore::HEAP, page_id,
+    bool auto_commit = (txn_id == 0);
+    uint64_t active_txn = auto_commit ? txns.begin() : txn_id;
+    uint64_t lsn = txns.appendRecord(active_txn, WALRecordType::UPDATE, WALStore::HEAP, page_id,
                                       frames[idx].before_image, after_image);
-    txns.commit(txn_id);
+    if (auto_commit) txns.commit(active_txn);
 
     frames[idx].page->setLSN(lsn);
     frames[idx].before_image_valid = false;

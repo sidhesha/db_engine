@@ -15,11 +15,11 @@ Page PageManager::readPage(int page_id) {
     return Page::deserialize(data);
 }
 
-void PageManager::writePage(Page& page) {
+void PageManager::writePage(Page& page, uint64_t txn_id) {
     std::vector<char> data = page.serialize();
     Page& cached = buffer_pool.fetchPage(page.getPageId());
     cached = Page::deserialize(data);
-    buffer_pool.unpinPage(page.getPageId(), true);
+    buffer_pool.unpinPage(page.getPageId(), true, txn_id);
 }
 
 int PageManager::allocatePage() {

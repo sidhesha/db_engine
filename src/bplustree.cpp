@@ -167,7 +167,7 @@ std::shared_ptr<BPlusTreeNode> BPlusTree::findAncestorForRelink(
     }
 }
 
-void BPlusTree::insert(const Key& key, int page_id, int slot_id) {
+void BPlusTree::insert(const Key& key, int page_id, int slot_id, uint64_t txn_id) {
     std::vector<std::shared_ptr<BPlusTreeNode>> dirty;
     DirtyScope dirty_scope(dirty);
 
@@ -231,7 +231,7 @@ void BPlusTree::insert(const Key& key, int page_id, int slot_id) {
         propagateSplit(ancestor_hints, split_left, split_right, split_key);
     }
 
-    saveDirty(dirty);
+    saveDirty(dirty, txn_id);
 }
 
 void BPlusTree::propagateSplit(std::vector<std::shared_ptr<BPlusTreeNode>>& ancestor_hints,
@@ -554,7 +554,7 @@ std::optional<RID> BPlusTree::search(const Key& key) {
     return current->findInLeaf(key);
 }
 
-bool BPlusTree::update(const Key& key, int new_page_id, int new_slot_id) {
+bool BPlusTree::update(const Key& key, int new_page_id, int new_slot_id, uint64_t txn_id) {
     std::vector<std::shared_ptr<BPlusTreeNode>> dirty;
     DirtyScope dirty_scope(dirty);
 
@@ -577,7 +577,7 @@ bool BPlusTree::update(const Key& key, int new_page_id, int new_slot_id) {
     bool ok = current->updateInLeaf(key, new_page_id, new_slot_id);
     if (ok) markDirty(node_ptr);
     current.release();
-    if (ok) saveDirty(dirty);
+    if (ok) saveDirty(dirty, txn_id);
     return ok;
 }
 
@@ -696,7 +696,7 @@ std::vector<std::pair<Key, RID>> BPlusTree::getAllKeyRIDPairs() const {
 
 
 
-bool BPlusTree::remove(const Key& key) {
+bool BPlusTree::remove(const Key& key, uint64_t txn_id) {
     std::vector<std::shared_ptr<BPlusTreeNode>> dirty;
     DirtyScope dirty_scope(dirty);
 
@@ -781,7 +781,7 @@ bool BPlusTree::remove(const Key& key) {
         swapRoot(nullptr);
         path.clear();
         structure_lock.release();
-        saveDirty(dirty);
+        saveDirty(dirty, txn_id);
         return true;
     }
 
@@ -798,7 +798,7 @@ bool BPlusTree::remove(const Key& key) {
     // still held here.
     path.clear();
     structure_lock.release();
-    saveDirty(dirty);
+    saveDirty(dirty, txn_id);
     return true;
 }
 
@@ -1095,7 +1095,7 @@ void BPlusTree::propagateSeparatorUpdate(std::vector<LatchHandle>& path, const K
     }
 }
 
-void BPlusTree::saveDirty(const std::vector<std::shared_ptr<BPlusTreeNode>>& dirty) {
+void BPlusTree::saveDirty(const std::vector<std::shared_ptr<BPlusTreeNode>>& dirty, uint64_t caller_txn_id) {
     if (!im) return;
     // Serializes IndexManager's actual file I/O across concurrent
     // operations (its fstream isn't safe for concurrent use); not a
@@ -1105,6 +1105,21 @@ void BPlusTree::saveDirty(const std::vector<std::shared_ptr<BPlusTreeNode>>& dir
     // changes, and saveDirty() no longer walks anything -- `dirty` is
     // already the fixed, concrete list of nodes this operation touched.
     std::lock_guard<std::mutex> io_lock(io_mutex);
+
+    // caller_txn_id == 0 (default): auto-begin/commit here, same as
+    // before Phase 5. A real caller_txn_id means everything this call
+    // writes -- node saves AND the root-pointer update below -- joins a
+    // caller-owned, multi-statement transaction that also covers heap
+    // writes; the caller commits/aborts, not us. Begun unconditionally
+    // (not just when dirty is non-empty) because setRootNodeID() needs a
+    // txn_id too: the root pointer must be undoable in exactly the same
+    // transaction as the node data it points at, or a crash between "new
+    // root node written" and "old, separately-committed root pointer
+    // update" can leave the on-disk root pointing at a node whose
+    // creation just got rolled back.
+    TransactionManager& txns = im->getTransactionManager();
+    bool auto_commit = (caller_txn_id == 0);
+    uint64_t txn_id = auto_commit ? txns.begin() : caller_txn_id;
 
     if (!dirty.empty()) {
         // Assign node_ids to brand-new nodes first, each under its own
@@ -1124,8 +1139,6 @@ void BPlusTree::saveDirty(const std::vector<std::shared_ptr<BPlusTreeNode>>& dir
         // so a crash mid-way through a multi-node structural change (a
         // split cascade, a merge) undoes as a single unit rather than
         // leaving some of the change applied and some not.
-        TransactionManager& txns = im->getTransactionManager();
-        uint64_t txn_id = txns.begin();
         for (auto& node : dirty) {
             // Shared: saveNode() only reads the node to serialize it.
             // Protects against a concurrent operation mutating this same
@@ -1134,11 +1147,12 @@ void BPlusTree::saveDirty(const std::vector<std::shared_ptr<BPlusTreeNode>>& dir
             LatchHandle guard(node, false);
             im->saveNode(node, txn_id);
         }
-        txns.commit(txn_id);
     }
 
     auto root_snapshot = snapshotRoot();
-    im->setRootNodeID(root_snapshot ? root_snapshot->node_id : -1);
+    im->setRootNodeID(root_snapshot ? root_snapshot->node_id : -1, txn_id);
+
+    if (auto_commit) txns.commit(txn_id);
     im->flush();
 }
 

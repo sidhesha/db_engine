@@ -3,6 +3,7 @@
 #include <cstring>
 #include <thread>
 #include <atomic>
+#include <chrono>
 #include <vector>
 #include <set>
 #include "key.hpp"
@@ -19,21 +20,22 @@
 #include "table.hpp"
 #include "wal.hpp"
 #include "recoverymanager.hpp"
+#include "lockmanager.hpp"
 
 static int passed = 0;
 static int failed = 0;
 
 #define TEST(name) \
     do { \
-        std::cout << "  " << name << "... "; \
+        std::cout << "  " << name << "... " << std::flush; \
         try {
 
 #define END_TEST \
-            std::cout << "PASS\n"; passed++; \
+            std::cout << "PASS\n" << std::flush; passed++; \
         } catch (const std::exception& e) { \
-            std::cout << "FAIL (" << e.what() << ")\n"; failed++; \
+            std::cout << "FAIL (" << e.what() << ")\n" << std::flush; failed++; \
         } catch (...) { \
-            std::cout << "FAIL (unknown)\n"; failed++; \
+            std::cout << "FAIL (unknown)\n" << std::flush; failed++; \
         } \
     } while(0)
 
@@ -119,6 +121,32 @@ static void test_record() {
         Record restored = Record::deserialize(r.serialize());
         assert(restored.getFields()[0].size() == 1000);
     } END_TEST;
+    TEST("MVCC header defaults to untracked/no-prev-version when unset") {
+        Record r(std::vector<std::string>{"a"});
+        assert(r.getCreateTxnId() == 0);
+        assert(r.getDeleteTxnId() == 0);
+        assert(!r.hasPrevVersion());
+    } END_TEST;
+    TEST("MVCC header round-trips through serialize/deserialize") {
+        Record r(std::vector<std::string>{"a", "b"}, 7, RID{3, 2});
+        r.setDeleteTxnId(9);
+        Record restored = Record::deserialize(r.serialize());
+        assert(restored.getCreateTxnId() == 7);
+        assert(restored.getDeleteTxnId() == 9);
+        assert(restored.hasPrevVersion());
+        assert(restored.getPrevVersion() == (RID{3, 2}));
+        assert(restored.getFields()[1] == "b");
+    } END_TEST;
+    TEST("delete_txn_id sits at a fixed offset patchable in place") {
+        Record r(std::vector<std::string>{"a"}, 1);
+        auto bytes = r.serialize();
+        uint64_t new_delete_txn_id = 5;
+        std::memcpy(bytes.data() + Record::DELETE_TXN_ID_OFFSET, &new_delete_txn_id, sizeof(new_delete_txn_id));
+        Record restored = Record::deserialize(bytes);
+        assert(restored.getCreateTxnId() == 1);   // untouched
+        assert(restored.getDeleteTxnId() == 5);   // patched in place
+        assert(restored.getFields()[0] == "a");   // body untouched
+    } END_TEST;
 }
 
 // ─── Page ────────────────────────────────────────────────────────────────────
@@ -147,12 +175,28 @@ static void test_page() {
         try { p.readRecord(slot); } catch (const std::runtime_error&) { caught = true; }
         assert(caught);
     } END_TEST;
-    TEST("double delete throws") {
+    TEST("double delete returns false instead of throwing") {
+        // Was a bug: this used to throw std::logic_error on the second
+        // call, with a dead `return false;` right after the unconditional
+        // throw. A no-op false is the correct, callable-in-a-loop result.
         Page p(0);
         int slot = p.insertRecord({'x'});
-        p.deleteRecord(slot);
+        assert(p.deleteRecord(slot));
+        assert(!p.deleteRecord(slot));
+    } END_TEST;
+    TEST("patchBytes overwrites in place without touching slot length") {
+        Page p(0);
+        int slot = p.insertRecord({'a', 'b', 'c', 'd'});
+        p.patchBytes(slot, 1, {'X', 'Y'});
+        auto r = p.readRecord(slot);
+        assert(r.size() == 4);
+        assert(r[0] == 'a' && r[1] == 'X' && r[2] == 'Y' && r[3] == 'd');
+    } END_TEST;
+    TEST("patchBytes rejects a write that would overrun the slot") {
+        Page p(0);
+        int slot = p.insertRecord({'a', 'b'});
         bool caught = false;
-        try { p.deleteRecord(slot); } catch (const std::logic_error&) { caught = true; }
+        try { p.patchBytes(slot, 1, {'X', 'Y'}); } catch (const std::out_of_range&) { caught = true; }
         assert(caught);
     } END_TEST;
     TEST("invalid slot throws") {
@@ -966,54 +1010,761 @@ static void test_recovery_end_to_end_via_real_bufferpool() {
 // ─── Table ───────────────────────────────────────────────────────────────────
 
 static void test_table_basic() {
-    const std::string file = "tbl_basic.db";
-    std::remove(file.c_str());
-    WALWriter wal(file + ".wal"); TransactionManager txns(wal);
+    const std::string data_file = "tbl_basic.db";
+    const std::string index_file = "tbl_basic.idx";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    WALWriter wal(data_file + ".wal"); TransactionManager txns(wal);
     TEST("insert and get by key") {
-        PageManager pm(file, wal, txns); RecordManager rm(pm);
-        Table t("users", Schema(std::vector<Column>{{"id","int"},{"name","string"}}), pm, rm);
+        PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+        IndexManager im(index_file, wal, txns);
+        Table t("users", Schema(std::vector<Column>{{"id","int"},{"name","string"}}), pm, rm, im);
         t.insert({"1","Alice"}); t.insert({"2","Bob"});
         auto r = t.getByKey("1");
         assert(r.has_value() && r->getFields()[1] == "Alice");
     } END_TEST;
     TEST("get nonexistent key") {
-        PageManager pm(file, wal, txns); RecordManager rm(pm);
-        Table t("x", Schema(std::vector<Column>{{"id","int"}}), pm, rm);
+        PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+        IndexManager im(index_file, wal, txns);
+        Table t("x", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im);
         assert(!t.getByKey("99").has_value());
     } END_TEST;
-    std::remove(file.c_str());
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
 }
 
 static void test_table_delete() {
-    const std::string file = "tbl_del.db";
-    std::remove(file.c_str());
-    WALWriter wal(file + ".wal"); TransactionManager txns(wal);
+    const std::string data_file = "tbl_del.db";
+    const std::string index_file = "tbl_del.idx";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    WALWriter wal(data_file + ".wal"); TransactionManager txns(wal);
     TEST("delete by key") {
-        PageManager pm(file, wal, txns); RecordManager rm(pm);
-        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm);
+        PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+        IndexManager im(index_file, wal, txns);
+        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im);
         t.insert({"1"}); assert(t.deleteByKey("1"));
         assert(!t.getByKey("1").has_value());
     } END_TEST;
     TEST("delete nonexistent") {
-        PageManager pm(file, wal, txns); RecordManager rm(pm);
-        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm);
+        PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+        IndexManager im(index_file, wal, txns);
+        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im);
         assert(!t.deleteByKey("99"));
     } END_TEST;
-    std::remove(file.c_str());
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
 }
 
 static void test_table_insert_mismatch() {
-    const std::string file = "tbl_mismatch.db";
-    std::remove(file.c_str());
+    const std::string data_file = "tbl_mismatch.db";
+    const std::string index_file = "tbl_mismatch.idx";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
     TEST("insert mismatched columns throws") {
-        WALWriter wal(file + ".wal"); TransactionManager txns(wal);
-        PageManager pm(file, wal, txns); RecordManager rm(pm);
-        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm);
+        WALWriter wal(data_file + ".wal"); TransactionManager txns(wal);
+        PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+        IndexManager im(index_file, wal, txns);
+        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im);
         bool caught = false;
         try { t.insert({"1","extra"}); } catch (const std::runtime_error&) { caught = true; }
         assert(caught);
     } END_TEST;
-    std::remove(file.c_str());
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+}
+
+static void test_table_restart() {
+    const std::string data_file = "tbl_restart.db";
+    const std::string index_file = "tbl_restart.idx";
+    const std::string wal_file = "tbl_restart.wal";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+    Schema schema(std::vector<Column>{{"id","int"},{"name","string"}});
+    TEST("Table's index survives a process restart (real IndexManager, not the disconnected in-memory default)") {
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            t.insert({"1","Alice"});
+            t.insert({"2","Bob"});
+        } // everything destructed -- simulates the process exiting cleanly
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            auto r = t.getByKey("2");
+            assert(r.has_value() && r->getFields()[1] == "Bob");
+        }
+    } END_TEST;
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+}
+
+// ─── MVCC (Phase 5) ────────────────────────────────────────────────────────
+
+static void test_mvcc_txn_grouping() {
+    const std::string data_file = "mvcc_grouping.db";
+    const std::string index_file = "mvcc_grouping.idx";
+    const std::string wal_file = "mvcc_grouping.wal";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+    Schema schema(std::vector<Column>{{"id","int"},{"name","string"}});
+    TEST("a multi-statement transaction's heap+index writes are undone as one atomic unit on crash") {
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+
+            // Two Table::insert calls (each touching both the heap page
+            // and the index) sharing ONE caller-owned txn_id -- before
+            // Session 2's txn_id threading, these would have been two
+            // independent auto-commit transactions with no way to undo
+            // them together.
+            uint64_t txn = t.beginTxn();
+            t.insert({"1", "Alice"}, txn);
+            t.insert({"2", "Bob"}, txn);
+            // Deliberately no t.commitTxn(txn) -- simulates a crash before
+            // commit. Scope exit still flushes dirty pages to disk (the
+            // WAL's "steal" policy allows that; it's what makes the undo
+            // pass necessary in the first place), so without recovery's
+            // undo pass this data would incorrectly survive.
+        }
+        {
+            WALWriter wal(wal_file);
+            RecoveryManager recovery(wal, data_file, index_file);
+            recovery.run();
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            assert(!t.getByKey("1").has_value());
+            assert(!t.getByKey("2").has_value());
+        }
+    } END_TEST;
+    TEST("a committed multi-statement transaction's writes all survive") {
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+
+            uint64_t txn = t.beginTxn();
+            t.insert({"3", "Carol"}, txn);
+            t.insert({"4", "Dave"}, txn);
+            t.commitTxn(txn);
+        }
+        {
+            WALWriter wal(wal_file);
+            RecoveryManager recovery(wal, data_file, index_file);
+            recovery.run();
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            auto a = t.getByKey("3");
+            auto b = t.getByKey("4");
+            assert(a.has_value() && a->getFields()[1] == "Carol");
+            assert(b.has_value() && b->getFields()[1] == "Dave");
+        }
+    } END_TEST;
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+}
+
+static void test_mvcc_visibility() {
+    const std::string data_file = "mvcc_vis.db";
+    const std::string index_file = "mvcc_vis.idx";
+    const std::string wal_file = "mvcc_vis.wal";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+    Schema schema(std::vector<Column>{{"id","int"},{"name","string"}});
+    WALWriter wal(wal_file); TransactionManager txns(wal);
+    PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+    IndexManager im(index_file, wal, txns);
+    Table t("users", schema, pm, rm, im);
+
+    TEST("a transaction sees its own uncommitted write, but no one else does yet") {
+        uint64_t txn = t.beginTxn();
+        t.insert({"1", "Alice"}, txn);
+
+        auto self_read = t.getByKey("1", txn);
+        assert(self_read.has_value() && self_read->getFields()[1] == "Alice");
+        assert(!t.getByKey("1").has_value());  // ad hoc read: not committed yet
+
+        t.commitTxn(txn);
+        assert(t.getByKey("1").has_value());  // committed now
+    } END_TEST;
+
+    TEST("a snapshot taken before a commit never sees it, even after that commit") {
+        uint64_t reader = t.beginTxn();
+
+        uint64_t writer = t.beginTxn();
+        t.insert({"2", "Bob"}, writer);
+        t.commitTxn(writer);
+
+        assert(!t.getByKey("2", reader).has_value());
+        t.commitTxn(reader);
+    } END_TEST;
+
+    TEST("a snapshot started after a commit does see it") {
+        uint64_t late_reader = t.beginTxn();
+        auto r = t.getByKey("2", late_reader);
+        assert(r.has_value() && r->getFields()[1] == "Bob");
+        t.commitTxn(late_reader);
+    } END_TEST;
+
+    TEST("an aborted transaction's writes are invisible to everyone, including snapshots started after the abort") {
+        uint64_t doomed = t.beginTxn();
+        t.insert({"3", "Ghost"}, doomed);
+        assert(t.getByKey("3", doomed).has_value());  // visible to itself pre-abort
+        t.abortTxn(doomed);
+
+        assert(!t.getByKey("3").has_value());
+
+        uint64_t later = t.beginTxn();
+        assert(!t.getByKey("3", later).has_value());  // still invisible to a fresh snapshot
+        t.commitTxn(later);
+    } END_TEST;
+
+    TEST("an aborted delete un-hides the row for later readers") {
+        t.insert({"4", "Persistent"});  // auto-commit
+
+        uint64_t doomed = t.beginTxn();
+        assert(t.deleteByKey("4", doomed));
+        assert(!t.getByKey("4", doomed).has_value());  // deleted from its own point of view
+        t.abortTxn(doomed);
+
+        assert(t.getByKey("4").has_value());  // delete rolled back
+    } END_TEST;
+
+    TEST("updateByKey chains a new version and repoints the index; an old snapshot still sees the pre-update value") {
+        t.insert({"5", "Original"});  // auto-commit
+        uint64_t reader = t.beginTxn();  // snapshot before the update
+
+        assert(t.updateByKey("5", {"5", "Updated"}));  // auto-commit update
+
+        auto fresh = t.getByKey("5");
+        assert(fresh.has_value() && fresh->getFields()[1] == "Updated");
+        auto old = t.getByKey("5", reader);
+        assert(old.has_value() && old->getFields()[1] == "Original");
+        t.commitTxn(reader);
+    } END_TEST;
+
+    TEST("updateByKey on a nonexistent key returns false") {
+        assert(!t.updateByKey("no-such-key", {"x", "y"}));
+    } END_TEST;
+
+    TEST("updateByKey on an already-deleted key returns false") {
+        t.insert({"7", "Temp"});
+        assert(t.deleteByKey("7"));
+        assert(!t.updateByKey("7", {"7", "Resurrected"}));
+    } END_TEST;
+
+    TEST("deleting then re-inserting the same key repoints the index instead of duplicating it") {
+        t.insert({"8", "First"});
+        assert(t.deleteByKey("8"));
+        assert(!t.getByKey("8").has_value());
+
+        t.insert({"8", "Second"});
+        auto r = t.getByKey("8");
+        assert(r.has_value() && r->getFields()[1] == "Second");
+    } END_TEST;
+
+    TEST("a snapshot predating a delete+reinsert still walks past the new version to the old one") {
+        t.insert({"9", "Before"});  // auto-commit
+        uint64_t reader = t.beginTxn();  // snapshot before the delete+reinsert
+
+        assert(t.deleteByKey("9"));       // auto-commit
+        t.insert({"9", "After"});         // auto-commit -- repoints the index, chained
+
+        auto seen_by_reader = t.getByKey("9", reader);
+        assert(seen_by_reader.has_value() && seen_by_reader->getFields()[1] == "Before");
+        auto seen_now = t.getByKey("9");
+        assert(seen_now.has_value() && seen_now->getFields()[1] == "After");
+        t.commitTxn(reader);
+    } END_TEST;
+
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+}
+
+static void test_mvcc_crash_recovery_versioning() {
+    const std::string data_file = "mvcc_crash.db";
+    const std::string index_file = "mvcc_crash.idx";
+    const std::string wal_file = "mvcc_crash.wal";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+    Schema schema(std::vector<Column>{{"id","int"},{"name","string"}});
+
+    TEST("an uncommitted update's new version is undone by recovery; the old version survives, live") {
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            t.insert({"1", "Original"});  // auto-commit, survives on its own
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            uint64_t txn = t.beginTxn();
+            assert(t.updateByKey("1", {"1", "Uncommitted"}, txn));
+            // No commitTxn -- simulates a crash mid-transaction. Both the
+            // old version's delete_txn_id patch and the new version's
+            // insert are WAL-logged under the same txn_id, so recovery's
+            // undo pass must revert them together.
+        }
+        {
+            WALWriter wal(wal_file);
+            RecoveryManager recovery(wal, data_file, index_file);
+            recovery.run();
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            auto r = t.getByKey("1");
+            assert(r.has_value() && r->getFields()[1] == "Original");
+        }
+    } END_TEST;
+
+    TEST("a committed update's new version survives recovery; the old version stays correctly superseded") {
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            uint64_t txn = t.beginTxn();
+            assert(t.updateByKey("1", {"1", "Committed"}, txn));
+            t.commitTxn(txn);
+        }
+        {
+            WALWriter wal(wal_file);
+            RecoveryManager recovery(wal, data_file, index_file);
+            recovery.run();
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            auto r = t.getByKey("1");
+            assert(r.has_value() && r->getFields()[1] == "Committed");
+        }
+    } END_TEST;
+
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+}
+
+static void test_lockmanager_basic() {
+    TEST("uncontended acquire succeeds immediately") {
+        LockManager lm;
+        RID r{1, 0};
+        lm.acquireExclusive(r, 100);
+        lm.releaseAll(100);
+    } END_TEST;
+
+    TEST("re-entrant acquire by the same transaction succeeds immediately") {
+        LockManager lm;
+        RID r{1, 0};
+        lm.acquireExclusive(r, 100);
+        lm.acquireExclusive(r, 100);  // same txn, same rid -- must not block on itself
+        lm.releaseAll(100);
+    } END_TEST;
+
+    TEST("locks on different RIDs never contend") {
+        LockManager lm;
+        RID r1{1, 0}, r2{2, 0};
+        lm.acquireExclusive(r1, 100);
+        lm.acquireExclusive(r2, 200);  // different txn, different rid -- must not block
+        lm.releaseAll(100);
+        lm.releaseAll(200);
+    } END_TEST;
+
+    TEST("a second transaction blocks until the first releases, then acquires") {
+        LockManager lm;
+        RID r{1, 0};
+        lm.acquireExclusive(r, 100);
+
+        std::atomic<bool> acquired{false};
+        std::thread waiter([&] {
+            lm.acquireExclusive(r, 200, std::chrono::milliseconds(3000));
+            acquired = true;
+            lm.releaseAll(200);
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        assert(!acquired);  // still blocked -- txn 100 hasn't released yet
+
+        lm.releaseAll(100);
+        waiter.join();
+        assert(acquired);
+    } END_TEST;
+
+    TEST("a wait that outlives its timeout throws LockTimeoutError instead of hanging forever") {
+        LockManager lm;
+        RID r{1, 0};
+        lm.acquireExclusive(r, 100);  // never released within this test
+
+        bool timed_out = false;
+        try {
+            lm.acquireExclusive(r, 200, std::chrono::milliseconds(150));
+        } catch (const LockManager::LockTimeoutError&) {
+            timed_out = true;
+        }
+        assert(timed_out);
+        lm.releaseAll(100);
+    } END_TEST;
+}
+
+static void test_lockmanager_deadlock() {
+    TEST("an A-wants-B/B-wants-A cycle is broken by aborting the younger transaction, not left to hang") {
+        // Repeated (not just run-once): CONCURRENCY_BUGS.md's own history
+        // in this codebase is that races can be as rare as 1-in-900, so a
+        // single clean pass proves little. This particular scenario is
+        // actually deterministic by construction (every possible
+        // interleaving of which thread detects the cycle first still
+        // victimizes the same, numerically-younger txn_id -- see
+        // lockmanager.cpp), but running it repeatedly is cheap and is
+        // exactly what would catch it if that reasoning were wrong.
+        for (int iter = 0; iter < 25; iter++) {
+            LockManager lm;
+            RID r1{1, 0}, r2{2, 0};
+            std::atomic<bool> txn1_holds_r1{false};
+            std::atomic<bool> txn2_holds_r2{false};
+            std::string txn1_result, txn2_result;
+
+            std::thread t1([&] {
+                try {
+                    lm.acquireExclusive(r1, 1);
+                    txn1_holds_r1 = true;
+                    while (!txn2_holds_r2) std::this_thread::yield();
+                    lm.acquireExclusive(r2, 1, std::chrono::milliseconds(3000));
+                    lm.releaseAll(1);
+                    txn1_result = "ok";
+                } catch (const LockManager::DeadlockError&) {
+                    lm.releaseAll(1);
+                    txn1_result = "deadlock";
+                } catch (const std::exception& e) {
+                    lm.releaseAll(1);
+                    txn1_result = std::string("unexpected: ") + e.what();
+                }
+            });
+            std::thread t2([&] {
+                try {
+                    lm.acquireExclusive(r2, 2);
+                    txn2_holds_r2 = true;
+                    while (!txn1_holds_r1) std::this_thread::yield();
+                    lm.acquireExclusive(r1, 2, std::chrono::milliseconds(3000));
+                    lm.releaseAll(2);
+                    txn2_result = "ok";
+                } catch (const LockManager::DeadlockError&) {
+                    lm.releaseAll(2);
+                    txn2_result = "deadlock";
+                } catch (const std::exception& e) {
+                    lm.releaseAll(2);
+                    txn2_result = std::string("unexpected: ") + e.what();
+                }
+            });
+            t1.join();
+            t2.join();
+
+            // The numerically younger transaction (2) is always the one
+            // aborted, regardless of which thread's acquireExclusive call
+            // happens to detect the cycle first.
+            if (txn1_result != "ok" || txn2_result != "deadlock") {
+                throw std::runtime_error("iteration " + std::to_string(iter) +
+                    ": txn1=" + txn1_result + " txn2=" + txn2_result);
+            }
+        }
+    } END_TEST;
+}
+
+static void test_mvcc_lock_integration() {
+    const std::string data_file = "mvcc_lock.db";
+    const std::string index_file = "mvcc_lock.idx";
+    const std::string wal_file = "mvcc_lock.wal";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+    Schema schema(std::vector<Column>{{"id","int"},{"name","string"}});
+    WALWriter wal(wal_file); TransactionManager txns(wal);
+    PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+    IndexManager im(index_file, wal, txns);
+    Table t("users", schema, pm, rm, im);
+
+    TEST("a concurrent writer genuinely blocks on Table's own lock, then correctly builds on the committed result") {
+        t.insert({"1", "Original"});  // auto-commit
+
+        uint64_t txn_a = t.beginTxn();
+        // A now holds locks on both the row it read (the original insert)
+        // and the new version this update just created -- see the
+        // acquireExclusive calls in Table::insert/updateByKey. The second
+        // one is what B below actually blocks on: by the time B looks
+        // this key up, the index already points past A to that new
+        // version.
+        assert(t.updateByKey("1", {"1", "FromA"}, txn_a));
+
+        std::atomic<bool> b_done{false};
+        std::string b_outcome;
+        std::thread writer_b([&] {
+            uint64_t txn_b = t.beginTxn();
+            bool ok = t.updateByKey("1", {"1", "FromB"}, txn_b);  // blocks until A commits/aborts
+            b_outcome = ok ? "ok" : "stale";
+            if (ok) t.commitTxn(txn_b); else t.abortTxn(txn_b);
+            b_done = true;
+        });
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        assert(!b_done);  // still blocked behind A's lock
+
+        t.commitTxn(txn_a);
+        writer_b.join();
+        assert(b_done);
+        // B was genuinely blocked ON A (not racing a stale read) and
+        // wakes to find A's version still live and now committed, so it
+        // correctly chains onto it and succeeds -- the write-write
+        // conflict serialized instead of corrupting or silently losing
+        // either write.
+        assert(b_outcome == "ok");
+
+        auto final = t.getByKey("1");
+        assert(final.has_value() && final->getFields()[1] == "FromB");
+    } END_TEST;
+
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+}
+
+static void test_mvcc_crash_recovery_mixed_ops() {
+    const std::string data_file = "mvcc_crash_mixed.db";
+    const std::string index_file = "mvcc_crash_mixed.idx";
+    const std::string wal_file = "mvcc_crash_mixed.wal";
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+    Schema schema(std::vector<Column>{{"id","int"},{"name","string"}});
+
+    TEST("a crash mid-transaction mixing insert+update+delete loses all of them atomically; a committed mix survives") {
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            t.insert({"1", "Alice"});
+            t.insert({"2", "Bob"});
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            uint64_t txn = t.beginTxn();
+            t.insert({"3", "Carol"}, txn);
+            assert(t.updateByKey("1", {"1", "AliceV2"}, txn));
+            assert(t.deleteByKey("2", txn));
+            // No commitTxn -- simulates a crash with all three kinds of
+            // write in flight under one transaction.
+        }
+        {
+            WALWriter wal(wal_file);
+            RecoveryManager recovery(wal, data_file, index_file);
+            recovery.run();
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            auto a = t.getByKey("1");
+            assert(a.has_value() && a->getFields()[1] == "Alice");  // update undone
+            assert(t.getByKey("2").has_value());                    // delete undone
+            assert(!t.getByKey("3").has_value());                   // insert undone
+
+            // Same mix again, this time committed.
+            uint64_t txn2 = t.beginTxn();
+            t.insert({"3", "Carol"}, txn2);
+            assert(t.updateByKey("1", {"1", "AliceV2"}, txn2));
+            assert(t.deleteByKey("2", txn2));
+            t.commitTxn(txn2);
+        }
+        {
+            WALWriter wal(wal_file);
+            RecoveryManager recovery(wal, data_file, index_file);
+            recovery.run();
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("users", schema, pm, rm, im);
+            auto a = t.getByKey("1");
+            assert(a.has_value() && a->getFields()[1] == "AliceV2");
+            assert(!t.getByKey("2").has_value());
+            auto c = t.getByKey("3");
+            assert(c.has_value() && c->getFields()[1] == "Carol");
+        }
+    } END_TEST;
+
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+}
+
+static void test_mvcc_stress_mixed_concurrent() {
+    const std::string data_file = "mvcc_stress.db";
+    const std::string index_file = "mvcc_stress.idx";
+    const std::string wal_file = "mvcc_stress.wal";
+
+    // Repeated-run discipline (CONCURRENCY_BUGS.md's own precedent), kept
+    // modest for local hardware -- heavier iteration counts belong in CI
+    // via a plain branch push, same as Phase 3/4's races.
+    constexpr int NUM_RUNS = 3;
+    constexpr int NUM_WRITERS = 4;
+    constexpr int KEYS_PER_WRITER = 15;
+    constexpr int NUM_INITIAL = NUM_WRITERS * KEYS_PER_WRITER;  // 60
+    constexpr int DELETES_PER_WRITER = 5;
+    constexpr int NEW_INSERTS_PER_WRITER = 10;
+
+    TEST("mixed concurrent insert/update/delete/read against a shared Table: no corruption, a stable snapshot sees no phantoms") {
+        for (int run = 0; run < NUM_RUNS; run++) {
+            std::remove(data_file.c_str());
+            std::remove(index_file.c_str());
+            std::remove(wal_file.c_str());
+            Schema schema(std::vector<Column>{{"id","string"},{"value","string"}});
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm(data_file, wal, txns); RecordManager rm(pm);
+            IndexManager im(index_file, wal, txns);
+            Table t("stress", schema, pm, rm, im);
+
+            auto ownedKey = [](int i) { return "k" + std::to_string(i); };
+            auto newKey = [](int writer, int i) {
+                return "new_" + std::to_string(writer) + "_" + std::to_string(i);
+            };
+
+            for (int i = 0; i < NUM_INITIAL; i++) {
+                t.insert({ownedKey(i), "v0"});
+            }
+
+            // Reader: takes a snapshot before any writer starts, then
+            // repeatedly re-reads the same fixed set of keys while
+            // writers run concurrently. A repeatable-read snapshot must
+            // see exactly what it saw on its first pass, every time --
+            // no phantoms from the concurrent updates/deletes/inserts
+            // below, no matter how the threads interleave.
+            std::atomic<bool> writers_done{false};
+            std::atomic<bool> reader_failed{false};
+            std::string reader_failure;
+            std::thread reader([&] {
+                uint64_t reader_txn = t.beginTxn();
+                std::vector<std::optional<std::string>> baseline(NUM_INITIAL);
+                for (int i = 0; i < NUM_INITIAL; i++) {
+                    auto r = t.getByKey(ownedKey(i), reader_txn);
+                    baseline[i] = r.has_value() ? std::optional<std::string>(r->getFields()[1]) : std::nullopt;
+                }
+                while (!writers_done.load()) {
+                    for (int i = 0; i < NUM_INITIAL; i++) {
+                        auto r = t.getByKey(ownedKey(i), reader_txn);
+                        std::optional<std::string> now =
+                            r.has_value() ? std::optional<std::string>(r->getFields()[1]) : std::nullopt;
+                        if (now != baseline[i]) {
+                            reader_failed = true;
+                            reader_failure = "key " + ownedKey(i) + " changed under a stable snapshot";
+                        }
+                    }
+                    std::this_thread::yield();
+                }
+                t.commitTxn(reader_txn);
+            });
+
+            std::vector<std::thread> writers;
+            for (int w = 0; w < NUM_WRITERS; w++) {
+                writers.emplace_back([&, w] {
+                    int base = w * KEYS_PER_WRITER;
+                    for (int i = 0; i < KEYS_PER_WRITER; i++) {
+                        std::string key = ownedKey(base + i);
+                        t.updateByKey(key, {key, "v1"});
+                        t.updateByKey(key, {key, "v2"});
+                    }
+                    for (int i = 0; i < DELETES_PER_WRITER; i++) {
+                        t.deleteByKey(ownedKey(base + i));
+                    }
+                    for (int i = 0; i < NEW_INSERTS_PER_WRITER; i++) {
+                        t.insert({newKey(w, i), "fresh"});
+                    }
+                });
+            }
+            for (auto& th : writers) th.join();
+            writers_done = true;
+            reader.join();
+
+            if (reader_failed.load()) {
+                throw std::runtime_error("run " + std::to_string(run) + ": " + reader_failure);
+            }
+
+            // Disjoint key ranges per writer make the end state fully
+            // deterministic despite the concurrency above.
+            for (int w = 0; w < NUM_WRITERS; w++) {
+                int base = w * KEYS_PER_WRITER;
+                for (int i = 0; i < DELETES_PER_WRITER; i++) {
+                    if (t.getByKey(ownedKey(base + i)).has_value()) {
+                        throw std::runtime_error("run " + std::to_string(run) + ": " +
+                            ownedKey(base + i) + " should be deleted");
+                    }
+                }
+                for (int i = DELETES_PER_WRITER; i < KEYS_PER_WRITER; i++) {
+                    auto r = t.getByKey(ownedKey(base + i));
+                    if (!r.has_value() || r->getFields()[1] != "v2") {
+                        throw std::runtime_error("run " + std::to_string(run) + ": " +
+                            ownedKey(base + i) + " should read v2");
+                    }
+                }
+                for (int i = 0; i < NEW_INSERTS_PER_WRITER; i++) {
+                    auto r = t.getByKey(newKey(w, i));
+                    if (!r.has_value() || r->getFields()[1] != "fresh") {
+                        throw std::runtime_error("run " + std::to_string(run) + ": " +
+                            newKey(w, i) + " should exist");
+                    }
+                }
+            }
+        }
+    } END_TEST;
+
+    std::remove(data_file.c_str());
+    std::remove(index_file.c_str());
+    std::remove(wal_file.c_str());
+}
+
+static void test_mvcc() {
+    test_mvcc_txn_grouping();
+    test_mvcc_visibility();
+    test_mvcc_crash_recovery_versioning();
+    test_lockmanager_basic();
+    test_lockmanager_deadlock();
+    test_mvcc_lock_integration();
+    test_mvcc_crash_recovery_mixed_ops();
+    test_mvcc_stress_mixed_concurrent();
 }
 
 // ─── BPlusTree Persistence ───────────────────────────────────────────────────
@@ -1574,7 +2325,10 @@ int main() {
     test_recovery_end_to_end_via_real_bufferpool();
 
     std::cout << "=== Table ===\n";
-    test_table_basic(); test_table_delete(); test_table_insert_mismatch();
+    test_table_basic(); test_table_delete(); test_table_insert_mismatch(); test_table_restart();
+
+    std::cout << "=== MVCC (Phase 5) ===\n";
+    test_mvcc();
 
     std::cout << "=== Concurrent BPlusTree (Phase 3) ===\n";
     test_concurrent_disjoint_inserts();

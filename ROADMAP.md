@@ -77,22 +77,23 @@ No shortcuts — each concept mirrors how a real database (PostgreSQL/InnoDB) wo
 
 ---
 
-## Phase 5: MVCC Transactions (≈ 4-5 sessions)
+## ✅ Phase 5: MVCC Transactions (COMPLETE)
 **What:** Multi-version concurrency control with undo logs — readers never block writers.
 **Why:** Basic 2PL is obsolete. PostgreSQL, InnoDB, and Oracle all use MVCC. It's the industry standard.
 
-**Plan:**
-- `Transaction` class: `txn_id`, `state` (ACTIVE/COMMITTED/ABORTED), `snapshot`
-- Undo log: append-only chain of before-images per transaction
-- Each page header stores a `last_LSN` to coordinate with WAL
-- Row-level visibility: each record carries `create_txn_id` / `delete_txn_id`
-- Snapshot isolation: a transaction sees rows committed before its start timestamp
-- Lock manager for serializable conflicts (still needed for predicate locking)
-- Deadlock detection: waits-for graph with timeout
-- On `ROLLBACK`: walk the undo log, restore before-images
-- Test: multiple threads reading/writing concurrently; phantom-free snapshots
+**Done:**
+- Found and fixed prerequisite gaps before any of this could work: `Table` built a disconnected, in-memory-only `BPlusTree`, silently bypassing all of Phases 1-4's persistence/WAL work; `txn_id` was generated internally by `BufferPool`/`BPlusTree::saveDirty()` and never exposed, so one logical "insert a row and update its index entry" was two independent auto-commit transactions with no shared identity
+- `Record` (`include/record.hpp`) carries a fixed MVCC header (`create_txn_id`, `delete_txn_id`, `prev_version` RID) ahead of its field data; `delete_txn_id` sits at a fixed offset so `Page::patchBytes()` can stamp it on an existing on-disk version in place
+- `caller_txn_id == 0` is a reserved sentinel meaning "no caller-owned transaction, behave exactly as before Phase 5," threaded as a default parameter through the whole write stack (`BufferPool` → `PageManager` → `RecordManager` → `BPlusTree` → `Table`) — every pre-Phase-5 call site needed zero changes
+- Rollback needs no separate physically-replayed undo log: an `UPDATE` never overwrites a version in place, it tombstones the old version's `delete_txn_id` and inserts a new one chained back via `prev_version` — that backward chain of full-tuple before-images *is* the undo log, and it falls out of the write path for free. `RecordManager::updateRecord`/`markDeleted` go through the same fetch/mutate/`writePage` path as everything else, so they're WAL-logged and crash-safe via `BufferPool`'s existing before/after-image diffing with no new recovery machinery
+- `MVCCManager` (`include/mvcc.hpp`/`transaction.hpp`) tracks in-memory transaction status and hands out `Snapshot{xmax, active_at_start}`s, and implements `isVisible()` — a from-scratch port of Postgres's tuple visibility rule: read-your-own-writes, an aborted transaction's writes invisible forever, a committed-but-concurrent-with-my-snapshot write invisible until a later snapshot. Deliberately not durable: `RecoveryManager` already guarantees only committed data is on disk by the time anything reads this, so it starts empty every process
+- `Table::getByKey` walks the version chain via `isVisible` when the head isn't visible to the caller's snapshot; `insert`/`updateByKey`/`deleteByKey` resolve `txn_id == 0` to a real, immediately-resolved transaction (aborting on exception or "nothing to do" instead of leaving one dangling), so a single statement's heap + index writes are always one atomic, MVCC-stamped unit
+- `LockManager` (`include/lockmanager.hpp`): row-level (RID-keyed) exclusive write locks with real OS-level blocking (`std::mutex` + `condition_variable`, not the B-tree's `RWSpinLatch` — a busy-spin design purpose-built for microsecond latch crabbing, wrong for a lock that can be held across a whole multi-statement transaction). MVCC readers never take these locks — only concurrent writers to the same row serialize
+- Deadlock detection is a real waits-for graph, not timeout-only: every transaction has at most one outstanding wait, so the graph is a functional graph and cycle detection is a plain chain walk; whichever side detects a cycle first victimizes the numerically younger transaction, so the outcome doesn't depend on scheduling. Timeout remains as a fallback bound for a wait that never resolves any other way
+- 21 new tests: read-your-own-writes, snapshot-before-commit-never-sees-it/after-does, aborted-writes-invisible-forever, aborted-delete-un-hides, update chaining with old-snapshot visibility, delete+reinsert index repointing without duplicating entries, crash-recovery tests for both single- and mixed-operation-type transactions, lock manager unit tests (uncontended/re-entrant/disjoint-RID/blocks-then-wakes/timeout), a repeated deadlock test, and a multi-threaded mixed insert/update/delete/read stress test against a shared `Table` proving a repeatable-read snapshot sees no phantoms while writers run concurrently around it
+- Full suite (124 → 145) validated stable across repeated runs, same discipline as Phase 3/4
 
-**Systems concept taught:** Snapshot isolation, visibility rules, undo logging, the read-set/write-set problem, true ACID compliance.
+**Systems concept taught:** Snapshot isolation, visibility rules, undo-via-version-chains, row-level locking vs. latching, waits-for-graph deadlock detection, true ACID compliance.
 
 ---
 
@@ -148,6 +149,6 @@ Each phase builds a sentence you can say in an interview. No fluff.
 | 2 — Buffer Pool | ✅ Done |
 | 3 — B-Tree Concurrency (Latch Crabbing + B-link) | ✅ Done |
 | 4 — Write-Ahead Log | ✅ Done |
-| 5 — MVCC Transactions | 🔜 Next |
-| 6 — SQL Frontend | ⏳ |
+| 5 — MVCC Transactions | ✅ Done |
+| 6 — SQL Frontend | 🔜 Next |
 | 7 — Benchmarking & Polish | ⏳ |

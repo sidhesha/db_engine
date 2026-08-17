@@ -132,12 +132,22 @@ bool Page::deleteRecord(int slot_id) {
     if (slot_id < 0 || slot_id >= num_slots) {
         throw std::out_of_range("Invalid slot ID");
     }
-    if(!slot_directory[slot_id].is_active){
-        throw std::logic_error("Slot already deleted");
-        return false;
+    if (!slot_directory[slot_id].is_active) {
+        return false;  // already deleted -- not an error, just a no-op
     }
     slot_directory[slot_id].is_active = 0;
     return true;
+}
+
+void Page::patchBytes(int slot_id, size_t offset, const std::vector<char>& patch) {
+    if (slot_id < 0 || slot_id >= num_slots) {
+        throw std::out_of_range("Invalid slot ID");
+    }
+    const SlotEntry& entry = slot_directory[slot_id];
+    if (offset + patch.size() > entry.length) {
+        throw std::out_of_range("patchBytes: write would overrun the record's slot");
+    }
+    std::memcpy(&data[entry.offset + offset], patch.data(), patch.size());
 }
 
 uint32_t Page::getPageId() const{

@@ -39,7 +39,12 @@ public:
     ~BufferPool();
 
     Page& fetchPage(int page_id);
-    void unpinPage(int page_id, bool dirty);
+    // txn_id == 0 (the default) means "no caller-owned transaction":
+    // logUpdateIfChanged() auto-begins/commits its own transaction, same
+    // as before Phase 5. A real, caller-supplied txn_id defers commit
+    // to the caller, so this page write can be grouped atomically with
+    // other writes (heap or index) under one multi-statement transaction.
+    void unpinPage(int page_id, bool dirty, uint64_t txn_id = 0);
     int allocatePage();
     int getNextPageId() const;
     void flush();
@@ -66,8 +71,10 @@ private:
     // if one isn't already pending for this dirty cycle.
     void captureBeforeImage(int idx);
     // Called from unpinPage(id, true): if the page's bytes actually
-    // changed since captureBeforeImage(), logs one auto-commit UPDATE
-    // record (WAL rule: flushed durably before this page can reach disk)
-    // and stamps the page's LSN.
-    void logUpdateIfChanged(int idx, int page_id);
+    // changed since captureBeforeImage(), logs an UPDATE record (WAL
+    // rule: flushed durably before this page can reach disk) and stamps
+    // the page's LSN. Auto-begins/commits its own transaction when
+    // txn_id == 0; otherwise appends under the caller's transaction and
+    // leaves commit/abort to them.
+    void logUpdateIfChanged(int idx, int page_id, uint64_t txn_id);
 };

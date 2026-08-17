@@ -118,43 +118,71 @@ void RecoveryManager::run() {
 
     // --- Identify losers: txns with no COMMIT record ---
     std::unordered_set<uint64_t> committed;
-    std::unordered_map<uint64_t, std::vector<const WALRecord*>> updates_by_txn;
+    // Latest BEGIN/UPDATE/CLR record per txn (records are in ascending-LSN
+    // order, so the last assignment wins) -- the point to resume undoing
+    // from, which may already be a CLR from an earlier recovery run.
+    std::unordered_map<uint64_t, uint64_t> last_lsn_per_txn;
+    std::unordered_map<uint64_t, const WALRecord*> by_lsn;
     for (auto& r : records) {
+        by_lsn[r.lsn] = &r;
         if (r.type == WALRecordType::COMMIT) {
             committed.insert(r.txn_id);
-        } else if (r.type == WALRecordType::UPDATE) {
-            updates_by_txn[r.txn_id].push_back(&r);
+        } else if (r.type == WALRecordType::BEGIN || r.type == WALRecordType::UPDATE ||
+                   r.type == WALRecordType::CLR) {
+            last_lsn_per_txn[r.txn_id] = r.lsn;
         }
     }
 
-    // --- Undo: revert each loser's UPDATEs in reverse order ---
-    for (auto& [txn_id, updates] : updates_by_txn) {
+    // --- Undo: walk each loser's chain backward via prev_lsn ---
+    // Recovery can run more than once over the same, ever-growing WAL (no
+    // checkpointing/truncation yet), so this must be safe to repeat: a
+    // txn's CLRs from an earlier run are already sitting in the log, and
+    // re-deriving "needs undo" from its raw UPDATE records (ignoring that
+    // those CLRs exist) would re-apply stale before-images on top of
+    // whatever a later, unrelated, *committed* transaction has since
+    // legitimately written to that same page -- silently destroying it.
+    // Starting from each loser's latest record and following prev_lsn
+    // (which a CLR inherits from the UPDATE it compensates for, i.e. it
+    // already points past that UPDATE) walks straight over already-undone
+    // work and stops at BEGIN, exactly like ARIES' UndoNxtLSN.
+    for (auto& [txn_id, last_lsn] : last_lsn_per_txn) {
         if (committed.count(txn_id)) continue;
 
-        for (auto it = updates.rbegin(); it != updates.rend(); ++it) {
-            const WALRecord* r = *it;
+        uint64_t cur_lsn = last_lsn;
+        while (cur_lsn != 0) {
+            auto it = by_lsn.find(cur_lsn);
+            if (it == by_lsn.end()) break;
+            const WALRecord* r = it->second;
 
-            WALRecord clr;
-            clr.txn_id = txn_id;
-            clr.type = WALRecordType::CLR;
-            clr.store = r->store;
-            clr.page_id = r->page_id;
-            clr.old_data = r->old_data;
-            clr.prev_lsn = r->prev_lsn;
-            uint64_t clr_lsn = wal.append(clr);
+            if (r->type == WALRecordType::BEGIN) break;
 
-            // Patch the reapplied image's own LSN field to the CLR's LSN
-            // (not whatever stale LSN old_data's bytes happened to carry
-            // from when it was originally captured as a before-image) --
-            // otherwise a page's on-disk LSN could regress, which the
-            // idempotent-redo comparison above relies on never happening.
-            std::vector<char> patched = r->old_data;
-            std::size_t lsn_offset = lsnFieldOffset(r->store);
-            if (patched.size() >= lsn_offset + sizeof(uint64_t)) {
-                std::memcpy(patched.data() + lsn_offset, &clr_lsn, sizeof(clr_lsn));
+            if (r->type == WALRecordType::UPDATE) {
+                WALRecord clr;
+                clr.txn_id = txn_id;
+                clr.type = WALRecordType::CLR;
+                clr.store = r->store;
+                clr.page_id = r->page_id;
+                clr.old_data = r->old_data;
+                clr.prev_lsn = r->prev_lsn;
+                uint64_t clr_lsn = wal.append(clr);
+
+                // Patch the reapplied image's own LSN field to the CLR's LSN
+                // (not whatever stale LSN old_data's bytes happened to carry
+                // from when it was originally captured as a before-image) --
+                // otherwise a page's on-disk LSN could regress, which the
+                // idempotent-redo comparison above relies on never happening.
+                std::vector<char> patched = r->old_data;
+                std::size_t lsn_offset = lsnFieldOffset(r->store);
+                if (patched.size() >= lsn_offset + sizeof(uint64_t)) {
+                    std::memcpy(patched.data() + lsn_offset, &clr_lsn, sizeof(clr_lsn));
+                }
+
+                writePageBytes(fileFor(r->store), offsetFor(r->store, r->page_id), patched);
             }
+            // r->type == CLR: this step was already undone in an earlier
+            // recovery run -- nothing to (re)apply, just keep walking back.
 
-            writePageBytes(fileFor(r->store), offsetFor(r->store, r->page_id), patched);
+            cur_lsn = r->prev_lsn;
         }
     }
 

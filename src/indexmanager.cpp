@@ -1,20 +1,49 @@
 #include "indexmanager.hpp"
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include "constants.hpp"
 
+namespace {
+// The root-pointer header lives in the same PAGE_SIZE-sized slot
+// preceding node 0 that nodeOffset()'s formula already reserves for it
+// (nodeOffset(-1) == PAGE_SIZE + (-1)*PAGE_SIZE == 0). Logging its
+// changes as a WALStore::INDEX UPDATE record with this reserved page_id
+// -- instead of writing the header directly to disk, which is what this
+// code used to do -- means RecoveryManager's existing generic redo/undo
+// (built entirely around "PAGE_SIZE-shaped blob with an LSN at a fixed
+// offset") protects it exactly like a real node, no special-casing
+// needed anywhere in RecoveryManager itself.
+constexpr int32_t ROOT_POINTER_PAGE_ID = -1;
+// Matches BPlusTreeNode's own on-disk header LSN offset (INDEX_LSN_OFFSET
+// in recoverymanager.cpp) so the same lsnFieldOffset(WALStore::INDEX)
+// RecoveryManager already uses for every other index page works here too.
+constexpr std::size_t ROOT_LSN_OFFSET = 12;
+}  // namespace
 
 IndexManager::IndexManager(const std::string& index_filename, WALWriter& wal, TransactionManager& txns)
     : filename(index_filename), next_node_id(0), root_node_id(-1), wal(wal), txns(txns) {
     openFile();
-    // Read header (root_node_id) from offset 0 if file has data
-    index_file.seekg(0, std::ios::beg);
-    if (index_file.good()) {
-        index_file.read(reinterpret_cast<char*>(&root_node_id), sizeof(int));
-        if (!index_file.good()) {
-            root_node_id = -1;
-            index_file.clear(); // stream may have failed on empty file
-        }
+    std::vector<char> header = currentHeaderBytes();
+    std::memcpy(&root_node_id, header.data(), sizeof(root_node_id));
+
+    // Materialize a proper PAGE_SIZE header slot up front if one doesn't
+    // exist yet. Without this, a LATER, unrelated ensureFileSize() call
+    // (e.g. from the very first saveNode(), growing the file out to
+    // cover node 0's slot at [PAGE_SIZE, 2*PAGE_SIZE)) zero-fills from
+    // the file's *current end* forward -- which, on a brand-new file,
+    // means straight through this header region too, as a side effect,
+    // before setRootNodeID() ever gets a chance to write its own value
+    // here. That accidental zero-fill is indistinguishable from a
+    // legitimate root_node_id == 0, permanently losing the "-1 == no
+    // root yet" sentinel and silently defeating setRootNodeID()'s
+    // change-detection (old reads back as 0 the same as new, so it
+    // thinks nothing changed and never logs the WAL record at all).
+    index_file.seekg(0, std::ios::end);
+    if (static_cast<std::size_t>(index_file.tellg()) < static_cast<std::size_t>(PAGE_SIZE)) {
+        index_file.seekp(0, std::ios::beg);
+        index_file.write(header.data(), header.size());
+        index_file.flush();
     }
 }
 
@@ -163,10 +192,51 @@ bool IndexManager::hasData() const {
     return root_node_id >= 0;
 }
 
-void IndexManager::setRootNodeID(int id) {
+std::vector<char> IndexManager::currentHeaderBytes() {
+    index_file.seekg(0, std::ios::end);
+    std::size_t file_size = index_file.tellg();
+    if (file_size < static_cast<std::size_t>(PAGE_SIZE)) {
+        // Never written -- root_node_id must read back as -1, not 0
+        // (0 is a valid real node_id once the tree has a root).
+        std::vector<char> buffer(PAGE_SIZE, 0);
+        int32_t unset = -1;
+        std::memcpy(buffer.data(), &unset, sizeof(unset));
+        return buffer;
+    }
+
+    std::vector<char> buffer(PAGE_SIZE);
+    index_file.seekg(0, std::ios::beg);
+    index_file.read(buffer.data(), PAGE_SIZE);
+    if (!index_file) {
+        index_file.clear();
+        throw std::runtime_error("IndexManager: failed to read root-pointer header");
+    }
+    return buffer;
+}
+
+void IndexManager::setRootNodeID(int id, uint64_t txn_id) {
+    std::vector<char> old_header = currentHeaderBytes();
+    int32_t old_id;
+    std::memcpy(&old_id, old_header.data(), sizeof(old_id));
+
     root_node_id = id;
+    if (old_id == id) {
+        return;  // no actual change -- nothing to log or write
+    }
+
+    std::vector<char> new_header = old_header;
+    int32_t new_id = id;
+    std::memcpy(new_header.data(), &new_id, sizeof(new_id));
+
+    uint64_t lsn = txns.appendRecord(txn_id, WALRecordType::UPDATE, WALStore::INDEX,
+                                      ROOT_POINTER_PAGE_ID, old_header, new_header);
+    // WAL rule: durable before the header itself reaches disk.
+    wal.flushUpTo(lsn);
+    std::memcpy(new_header.data() + ROOT_LSN_OFFSET, &lsn, sizeof(lsn));
+
+    ensureFileSize(PAGE_SIZE);
     index_file.seekp(0, std::ios::beg);
-    index_file.write(reinterpret_cast<const char*>(&root_node_id), sizeof(int));
+    index_file.write(new_header.data(), new_header.size());
     index_file.flush();
 }
 
