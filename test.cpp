@@ -7,6 +7,8 @@
 #include <vector>
 #include <set>
 #include <filesystem>
+#include <random>
+#include <unordered_map>
 #include "key.hpp"
 #include "schema.hpp"
 #include "record.hpp"
@@ -1783,6 +1785,102 @@ static void test_sql() {
     test_sql_crash_recovery();
 }
 
+// ─── Fuzz Testing (Phase 7 Session 4) ─────────────────────────────────────────
+// Model-based, not crash-only: a shadow std::unordered_map mirrors each
+// key's expected live value through a long randomized sequence of real
+// Table calls, catching silent wrong-answer bugs, not just crashes.
+
+static void test_fuzz_table() {
+    const std::string dir = "fuzz_table";
+    std::filesystem::remove_all(dir);
+
+    TEST("a long randomized insert/update/delete/get sequence matches a shadow model") {
+        // Genuinely random per run (not a fixed seed) -- printed
+        // unconditionally, not just on failure, so any run (pass or
+        // fail) can be reproduced later by hardcoding this value.
+        std::random_device rd;
+        std::uint32_t seed = rd();
+        std::cout << "[seed=" << seed << "] " << std::flush;
+        std::mt19937 rng(seed);
+
+        {
+        Database db(dir);
+        db.createTable("fuzz", Schema(std::vector<Column>{{"id", "string"}, {"value", "string"}}));
+        Table& t = db.getTable("fuzz");
+
+        // Absent from the map == not currently live (never inserted, or
+        // deleted). Fields stored exactly as Record::getFields() would
+        // return them, so a direct == comparison is a real assertion,
+        // not just "did it not crash."
+        std::unordered_map<std::string, std::vector<std::string>> shadow;
+
+        constexpr int KEY_SPACE = 50;
+        constexpr int OPS = 3000;
+        std::uniform_int_distribution<int> key_dist(0, KEY_SPACE - 1);
+        std::uniform_int_distribution<int> op_dist(0, 3);  // 0=insert 1=update 2=delete 3=get
+
+        for (int iter = 0; iter < OPS; iter++) {
+            std::string key = std::to_string(key_dist(rng));
+            std::string value = "v" + std::to_string(iter);
+            bool live = shadow.count(key) > 0;
+
+            switch (op_dist(rng)) {
+                case 0:  // insert -- only when not currently live: Table::insert's
+                         // own documented behavior for re-inserting an
+                         // already-live key is explicitly undefined (see
+                         // table.cpp), not something a correctness fuzzer
+                         // should exercise.
+                    if (live) break;
+                    t.insert(std::vector<std::string>{key, value});
+                    shadow[key] = {key, value};
+                    break;
+                case 1: {  // update
+                    bool ok = t.updateByKey(key, std::vector<std::string>{key, value});
+                    assert(ok == live);
+                    if (ok) shadow[key] = {key, value};
+                    break;
+                }
+                case 2: {  // delete
+                    bool ok = t.deleteByKey(key);
+                    assert(ok == live);
+                    if (ok) shadow.erase(key);
+                    break;
+                }
+                case 3: {  // get -- cross-check against the shadow model
+                    auto rec = t.getByKey(key);
+                    auto it = shadow.find(key);
+                    if (it == shadow.end()) {
+                        assert(!rec.has_value());
+                    } else {
+                        assert(rec.has_value());
+                        assert(rec->getFields() == it->second);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Final sweep over the whole key space: every key the shadow
+        // says is live reads back correctly, and every key it says isn't
+        // is correctly absent -- not just whatever the last few random
+        // ops happened to touch.
+        for (int k = 0; k < KEY_SPACE; k++) {
+            std::string key = std::to_string(k);
+            auto rec = t.getByKey(key);
+            auto it = shadow.find(key);
+            if (it == shadow.end()) {
+                assert(!rec.has_value());
+            } else {
+                assert(rec.has_value());
+                assert(rec->getFields() == it->second);
+            }
+        }
+        }
+    } END_TEST;
+
+    std::filesystem::remove_all(dir);
+}
+
 // ─── MVCC (Phase 5) ────────────────────────────────────────────────────────
 
 static void test_mvcc_txn_grouping() {
@@ -3109,6 +3207,9 @@ int main() {
 
     std::cout << "=== SQL Frontend (Phase 6) ===\n";
     test_sql();
+
+    std::cout << "=== Fuzz Testing (Phase 7) ===\n";
+    test_fuzz_table();
 
     std::cout << "=== MVCC (Phase 5) ===\n";
     test_mvcc();
