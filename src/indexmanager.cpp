@@ -1,8 +1,8 @@
-#include "indexmanager.hpp"
+#include "db_engine/indexmanager.hpp"
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
-#include "constants.hpp"
+#include "db_engine/constants.hpp"
 
 namespace {
 // The root-pointer header lives in the same PAGE_SIZE-sized slot

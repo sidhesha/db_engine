@@ -2,8 +2,8 @@
 #pragma once
 #include <fstream>
 #include <memory>
-#include "node.hpp"
-#include "wal.hpp"
+#include "db_engine/node.hpp"
+#include "db_engine/wal.hpp"
 
 class IndexManager {
 public:

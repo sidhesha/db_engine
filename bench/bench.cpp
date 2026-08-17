@@ -12,10 +12,10 @@
 #include <thread>
 #include <vector>
 
-#include "bplustree.hpp"
-#include "bufferpool.hpp"
-#include "database.hpp"
-#include "evictionpolicy.hpp"
+#include "db_engine/bplustree.hpp"
+#include "db_engine/bufferpool.hpp"
+#include "db_engine/database.hpp"
+#include "db_engine/evictionpolicy.hpp"
 
 namespace {
 

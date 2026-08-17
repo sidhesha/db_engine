@@ -3,7 +3,7 @@
 #include <fstream>
 #include <string>
 #include <unordered_map>
-#include "wal.hpp"
+#include "db_engine/wal.hpp"
 
 // ARIES-style crash recovery, run once at engine startup before
 // BufferPool/IndexManager open their files for normal use. Operates

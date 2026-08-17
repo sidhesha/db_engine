@@ -1,9 +1,9 @@
 #pragma once
 
-#include "node.hpp"
-#include "indexmanager.hpp"
-#include "latch.hpp"
-#include "latchhandle.hpp"
+#include "db_engine/node.hpp"
+#include "db_engine/indexmanager.hpp"
+#include "db_engine/latch.hpp"
+#include "db_engine/latchhandle.hpp"
 #include <memory>
 #include <mutex>
 

@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
-#include "constants.hpp"
+#include "db_engine/constants.hpp"
 
 // Row-level (RID-keyed) write-write locking for MVCC (Phase 5). MVCC's
 // whole point is readers never block: there are no read locks here, only

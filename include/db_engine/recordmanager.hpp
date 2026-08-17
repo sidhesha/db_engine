@@ -4,9 +4,9 @@
 #include <optional>
 #include <string>
 #include <vector>
-#include "record.hpp"
-#include "pagemanager.hpp"
-#include "constants.hpp"
+#include "db_engine/record.hpp"
+#include "db_engine/pagemanager.hpp"
+#include "db_engine/constants.hpp"
 
 class RecordManager {
 public:

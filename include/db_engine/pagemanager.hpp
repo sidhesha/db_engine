@@ -1,8 +1,8 @@
 #pragma once
 
-#include "page.hpp"
-#include "bufferpool.hpp"
-#include "wal.hpp"
+#include "db_engine/page.hpp"
+#include "db_engine/bufferpool.hpp"
+#include "db_engine/wal.hpp"
 #include <string>
 
 class PageManager {

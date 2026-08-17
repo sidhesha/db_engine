@@ -1,6 +1,6 @@
-#include "evictionpolicy.hpp"
+#include "db_engine/evictionpolicy.hpp"
 
-#include "bufferpool.hpp"  // BufferFrame's full definition (pin_count)
+#include "db_engine/bufferpool.hpp"  // BufferFrame's full definition (pin_count)
 
 void ClockSweepPolicy::ensureSized(std::size_t n) {
     if (ref_bits.size() < n) ref_bits.resize(n, false);

@@ -1,10 +1,10 @@
-#include "sqlserver.hpp"
+#include "db_engine/sqlserver.hpp"
 
 #include <stdexcept>
 #include <string>
 
-#include "lexer.hpp"
-#include "parser.hpp"
+#include "db_engine/lexer.hpp"
+#include "db_engine/parser.hpp"
 
 namespace {
 std::string formatResult(const Stmt& stmt, const QueryResult& result) {

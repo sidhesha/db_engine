@@ -4,8 +4,8 @@
 #include <string>
 #include <vector>
 
-#include "ast.hpp"
-#include "database.hpp"
+#include "db_engine/ast.hpp"
+#include "db_engine/database.hpp"
 
 struct QueryResult {
     bool ok = true;

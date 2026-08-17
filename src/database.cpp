@@ -1,9 +1,9 @@
-#include "database.hpp"
+#include "db_engine/database.hpp"
 
 #include <filesystem>
 #include <stdexcept>
 
-#include "recoverymanager.hpp"
+#include "db_engine/recoverymanager.hpp"
 
 namespace {
 std::string ensureDir(const std::string& dir) {

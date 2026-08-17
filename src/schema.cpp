@@ -1,4 +1,4 @@
-#include "schema.hpp"
+#include "db_engine/schema.hpp"
 #include <sstream>
 
 Schema::Schema(const std::vector<Column>& columns): columns(columns) {};
