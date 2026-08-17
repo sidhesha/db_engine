@@ -7,6 +7,23 @@
 #include "db_engine/parser.hpp"
 
 namespace {
+// Winsock needs an explicit init/teardown pair around any socket use;
+// BSD sockets need nothing here. Centralized so the constructor/
+// destructor below don't repeat an #ifdef at every call site (three
+// error paths in the constructor alone).
+#ifdef _WIN32
+void platformSocketInit() {
+    WSADATA wsa_data;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
+        throw std::runtime_error("SqlServer: WSAStartup failed");
+    }
+}
+void platformSocketCleanup() { WSACleanup(); }
+#else
+void platformSocketInit() {}
+void platformSocketCleanup() {}
+#endif
+
 std::string formatResult(const Stmt& stmt, const QueryResult& result) {
     if (!result.ok) {
         return "ERROR: " + result.message + "\n";
@@ -37,22 +54,21 @@ std::string formatResult(const Stmt& stmt, const QueryResult& result) {
 }  // namespace
 
 SqlServer::SqlServer(Database& db, uint16_t port) : db(db), port(port) {
-    WSADATA wsa_data;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
-        throw std::runtime_error("SqlServer: WSAStartup failed");
-    }
+    platformSocketInit();
 
     listen_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listen_socket == INVALID_SOCKET) {
-        WSACleanup();
+        platformSocketCleanup();
         throw std::runtime_error("SqlServer: socket() failed");
     }
 
     // Lets a server restarted on the same port bind immediately instead
     // of failing with "address already in use" while the OS still has
     // the previous socket lingering in TIME_WAIT -- relevant for tests
-    // that start/stop a server repeatedly against a fixed port.
-    BOOL reuse = TRUE;
+    // that start/stop a server repeatedly against a fixed port. `int`
+    // (not Windows' BOOL) works identically on both platforms here --
+    // BOOL is itself just `typedef int BOOL` in the Windows headers.
+    int reuse = 1;
     setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR,
                reinterpret_cast<const char*>(&reuse), sizeof(reuse));
 
@@ -63,13 +79,13 @@ SqlServer::SqlServer(Database& db, uint16_t port) : db(db), port(port) {
 
     if (bind(listen_socket, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
         closesocket(listen_socket);
-        WSACleanup();
+        platformSocketCleanup();
         throw std::runtime_error("SqlServer: bind() failed on port " + std::to_string(port));
     }
 
     if (listen(listen_socket, SOMAXCONN) == SOCKET_ERROR) {
         closesocket(listen_socket);
-        WSACleanup();
+        platformSocketCleanup();
         throw std::runtime_error("SqlServer: listen() failed");
     }
 }
@@ -79,7 +95,7 @@ SqlServer::~SqlServer() {
     if (listen_socket != INVALID_SOCKET) {
         closesocket(listen_socket);
     }
-    WSACleanup();
+    platformSocketCleanup();
 }
 
 void SqlServer::start() {
@@ -106,7 +122,7 @@ void SqlServer::stop() {
 void SqlServer::acceptLoop() {
     while (running) {
         sockaddr_in client_addr{};
-        int addr_len = sizeof(client_addr);
+        addrlen_t addr_len = sizeof(client_addr);
         SOCKET client = accept(listen_socket, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
         if (client == INVALID_SOCKET) {
             // Either a real transient error, or stop() just closed

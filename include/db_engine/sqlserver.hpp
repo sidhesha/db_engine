@@ -1,5 +1,15 @@
 #pragma once
 
+// Platform socket compat shim. Winsock2 (Windows) and BSD/POSIX sockets
+// (Linux/macOS) agree on almost everything that matters here --
+// socket()/bind()/listen()/accept()/send()/recv() all have the same
+// names and near-identical signatures -- so rather than wrapping every
+// call site in #ifdef, this aliases the handful of names that actually
+// differ (SOCKET's underlying type, the "invalid" sentinel, close vs.
+// closesocket, and Winsock's own init/teardown) so the rest of this
+// class's code -- everything below this block -- is written once and
+// compiles identically on both.
+#ifdef _WIN32
 // winsock2.h pulls in windows.h. Defined before that include (and before
 // any other file in this project transitively includes it) to avoid two
 // classic landmines: windows.h's own winsock1 declarations conflicting
@@ -12,6 +22,20 @@
 #define NOMINMAX
 #endif
 #include <winsock2.h>
+using addrlen_t = int;
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+using SOCKET = int;
+using addrlen_t = socklen_t;
+constexpr int INVALID_SOCKET = -1;
+constexpr int SOCKET_ERROR = -1;
+inline int closesocket(int fd) { return close(fd); }
+#endif
 
 #include <atomic>
 #include <cstdint>
@@ -22,9 +46,9 @@
 #include "db_engine/database.hpp"
 #include "db_engine/executor.hpp"
 
-// Winsock2-based TCP server (this project targets MinGW/UCRT64 on
-// Windows -- no need for a cross-platform socket abstraction). Accepts
-// connections and spawns one thread per connection: Database/Table/
+// TCP server, Winsock2 on Windows / BSD sockets on Linux and macOS (see
+// the compat shim above). Accepts connections and spawns one thread per
+// connection: Database/Table/
 // MVCCManager/LockManager are already safe under concurrent callers by
 // construction (Phase 5 Session 5's stress testing proved this), so
 // serving connections concurrently costs almost nothing and is the only

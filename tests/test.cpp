@@ -1572,7 +1572,9 @@ static std::string sqlRecvResponse(SOCKET s) {
         FD_ZERO(&readfds);
         FD_SET(s, &readfds);
         timeval tv = got_any ? timeval{0, 50000} : timeval{30, 0};  // 50ms once flowing, else 30s ceiling
-        int rc = select(0, &readfds, nullptr, nullptr, &tv);
+        // First arg is ignored on Windows but is a real, required nfds
+        // (highest fd + 1) on POSIX -- s + 1 is correct on both.
+        int rc = select(static_cast<int>(s) + 1, &readfds, nullptr, nullptr, &tv);
         if (rc <= 0) break;
         int n = recv(s, buf, sizeof(buf), 0);
         if (n <= 0) break;
