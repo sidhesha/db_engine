@@ -39,9 +39,9 @@ Table::Table(const std::string& name,
              const Schema& schema,
              PageManager& pm,
              RecordManager& rm,
-             IndexManager& im)
-    : name(name), schema(schema), record_manager(rm), page_manager(pm), index(im),
-      mvcc(im.getTransactionManager()) {}
+             IndexManager& im,
+             MVCCManager& mvcc)
+    : name(name), schema(schema), record_manager(rm), page_manager(pm), index(im), mvcc(mvcc) {}
 
 uint64_t Table::beginTxn() { return mvcc.begin(); }
 void Table::commitTxn(uint64_t txn_id) { mvcc.commit(txn_id); }
@@ -151,14 +151,8 @@ bool Table::updateByKey(const std::string& key, const std::vector<std::string>& 
     return true;
 }
 
-std::optional<Record> Table::getByKey(const std::string& key, uint64_t txn_id) {
-    auto rid_opt = index.search(key);
-    if (!rid_opt.has_value()) {
-        return std::nullopt;
-    }
-
-    Snapshot snapshot = mvcc.getSnapshot(txn_id);
-    RID current_rid = rid_opt.value();
+std::optional<Record> Table::findVisibleVersion(RID start_rid, uint64_t txn_id, const Snapshot& snapshot) {
+    RID current_rid = start_rid;
     while (true) {
         Record rec = record_manager.readRecord(current_rid);
         if (mvcc.isVisible(rec.getCreateTxnId(), rec.getDeleteTxnId(), txn_id, snapshot)) {
@@ -169,6 +163,28 @@ std::optional<Record> Table::getByKey(const std::string& key, uint64_t txn_id) {
         }
         current_rid = rec.getPrevVersion();
     }
+}
+
+std::optional<Record> Table::getByKey(const std::string& key, uint64_t txn_id) {
+    auto rid_opt = index.search(key);
+    if (!rid_opt.has_value()) {
+        return std::nullopt;
+    }
+
+    Snapshot snapshot = mvcc.getSnapshot(txn_id);
+    return findVisibleVersion(rid_opt.value(), txn_id, snapshot);
+}
+
+std::vector<std::pair<Key, Record>> Table::scanAll(uint64_t txn_id) {
+    Snapshot snapshot = mvcc.getSnapshot(txn_id);
+    std::vector<std::pair<Key, Record>> results;
+    for (const auto& [key, rid] : index.getAllKeyRIDPairs()) {
+        auto visible = findVisibleVersion(rid, txn_id, snapshot);
+        if (visible.has_value()) {
+            results.emplace_back(key, std::move(visible.value()));
+        }
+    }
+    return results;
 }
 
 

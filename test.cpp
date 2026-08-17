@@ -6,6 +6,7 @@
 #include <chrono>
 #include <vector>
 #include <set>
+#include <filesystem>
 #include "key.hpp"
 #include "schema.hpp"
 #include "record.hpp"
@@ -21,6 +22,12 @@
 #include "wal.hpp"
 #include "recoverymanager.hpp"
 #include "lockmanager.hpp"
+#include "mvcc.hpp"
+#include "database.hpp"
+#include "lexer.hpp"
+#include "parser.hpp"
+#include "executor.hpp"
+#include "sqlserver.hpp"
 
 static int passed = 0;
 static int failed = 0;
@@ -1018,7 +1025,8 @@ static void test_table_basic() {
     TEST("insert and get by key") {
         PageManager pm(data_file, wal, txns); RecordManager rm(pm);
         IndexManager im(index_file, wal, txns);
-        Table t("users", Schema(std::vector<Column>{{"id","int"},{"name","string"}}), pm, rm, im);
+        MVCCManager mvcc(txns);
+        Table t("users", Schema(std::vector<Column>{{"id","int"},{"name","string"}}), pm, rm, im, mvcc);
         t.insert({"1","Alice"}); t.insert({"2","Bob"});
         auto r = t.getByKey("1");
         assert(r.has_value() && r->getFields()[1] == "Alice");
@@ -1026,7 +1034,8 @@ static void test_table_basic() {
     TEST("get nonexistent key") {
         PageManager pm(data_file, wal, txns); RecordManager rm(pm);
         IndexManager im(index_file, wal, txns);
-        Table t("x", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im);
+        MVCCManager mvcc(txns);
+        Table t("x", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im, mvcc);
         assert(!t.getByKey("99").has_value());
     } END_TEST;
     std::remove(data_file.c_str());
@@ -1042,14 +1051,16 @@ static void test_table_delete() {
     TEST("delete by key") {
         PageManager pm(data_file, wal, txns); RecordManager rm(pm);
         IndexManager im(index_file, wal, txns);
-        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im);
+        MVCCManager mvcc(txns);
+        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im, mvcc);
         t.insert({"1"}); assert(t.deleteByKey("1"));
         assert(!t.getByKey("1").has_value());
     } END_TEST;
     TEST("delete nonexistent") {
         PageManager pm(data_file, wal, txns); RecordManager rm(pm);
         IndexManager im(index_file, wal, txns);
-        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im);
+        MVCCManager mvcc(txns);
+        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im, mvcc);
         assert(!t.deleteByKey("99"));
     } END_TEST;
     std::remove(data_file.c_str());
@@ -1065,7 +1076,8 @@ static void test_table_insert_mismatch() {
         WALWriter wal(data_file + ".wal"); TransactionManager txns(wal);
         PageManager pm(data_file, wal, txns); RecordManager rm(pm);
         IndexManager im(index_file, wal, txns);
-        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im);
+        MVCCManager mvcc(txns);
+        Table t("t", Schema(std::vector<Column>{{"id","int"}}), pm, rm, im, mvcc);
         bool caught = false;
         try { t.insert({"1","extra"}); } catch (const std::runtime_error&) { caught = true; }
         assert(caught);
@@ -1087,7 +1099,8 @@ static void test_table_restart() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             t.insert({"1","Alice"});
             t.insert({"2","Bob"});
         } // everything destructed -- simulates the process exiting cleanly
@@ -1095,7 +1108,8 @@ static void test_table_restart() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             auto r = t.getByKey("2");
             assert(r.has_value() && r->getFields()[1] == "Bob");
         }
@@ -1103,6 +1117,670 @@ static void test_table_restart() {
     std::remove(data_file.c_str());
     std::remove(index_file.c_str());
     std::remove(wal_file.c_str());
+}
+
+// ─── Database (Phase 6 Session 1: multi-table storage) ───────────────────────
+
+static void test_database_two_tables_survive_restart() {
+    const std::string dir = "db_multitable_restart";
+    std::filesystem::remove_all(dir);
+
+    TEST("two tables, each with their own heap+index files, both survive a process restart") {
+        {
+            Database db(dir);
+            db.createTable("users", Schema(std::vector<Column>{{"id","int"},{"name","string"}}));
+            db.createTable("products", Schema(std::vector<Column>{{"sku","string"},{"price","int"}}));
+            db.getTable("users").insert({"1", "Alice"});
+            db.getTable("users").insert({"2", "Bob"});
+            db.getTable("products").insert({"a1", "100"});
+        }  // Database destructed -- simulates a clean process exit
+        {
+            Database db(dir);
+            assert(db.hasTable("users") && db.hasTable("products"));
+
+            auto alice = db.getTable("users").getByKey("1");
+            assert(alice.has_value() && alice->getFields()[1] == "Alice");
+            auto bob = db.getTable("users").getByKey("2");
+            assert(bob.has_value() && bob->getFields()[1] == "Bob");
+
+            auto sku = db.getTable("products").getByKey("a1");
+            assert(sku.has_value() && sku->getFields()[1] == "100");
+        }
+    } END_TEST;
+
+    std::filesystem::remove_all(dir);
+}
+
+static void test_database_crash_spanning_two_tables_undone_atomically() {
+    const std::string dir = "db_multitable_crash";
+    std::filesystem::remove_all(dir);
+
+    TEST("a crash mid-transaction that touched two different tables loses both tables' writes atomically") {
+        {
+            Database db(dir);
+            db.createTable("a", Schema(std::vector<Column>{{"id", "int"}}));
+            db.createTable("b", Schema(std::vector<Column>{{"id", "int"}}));
+        }
+        {
+            Database db(dir);
+            uint64_t txn = db.beginTxn();
+            db.getTable("a").insert({"1"}, txn);
+            db.getTable("b").insert({"1"}, txn);
+            // No commitTxn -- simulates a crash with one transaction's
+            // writes in flight across two different tables' heaps and
+            // indexes, all sharing this one Database's WAL.
+        }
+        {
+            // Database's constructor runs RecoveryManager itself before
+            // this scope's own reads -- this is the actual test.
+            Database db(dir);
+            assert(!db.getTable("a").getByKey("1").has_value());
+            assert(!db.getTable("b").getByKey("1").has_value());
+
+            // Prove the WAL/txn_id space really was shared (not two
+            // coincidentally-successful independent recoveries): commit a
+            // transaction touching both tables afterward and confirm it
+            // takes effect normally.
+            uint64_t txn2 = db.beginTxn();
+            db.getTable("a").insert({"1"}, txn2);
+            db.getTable("b").insert({"1"}, txn2);
+            db.commitTxn(txn2);
+            assert(db.getTable("a").getByKey("1").has_value());
+            assert(db.getTable("b").getByKey("1").has_value());
+        }
+    } END_TEST;
+
+    std::filesystem::remove_all(dir);
+}
+
+static void test_recovery_multitable_routing() {
+    const std::string wal_file = "recovery_multitable.wal";
+    const std::string a_heap = "recovery_multitable_a.heap", a_idx = "recovery_multitable_a.idx";
+    const std::string b_heap = "recovery_multitable_b.heap", b_idx = "recovery_multitable_b.idx";
+    for (const std::string& f : {wal_file, a_heap, a_idx, b_heap, b_idx}) std::remove(f.c_str());
+    Schema schema(std::vector<Column>{{"id", "int"}});
+
+    TEST("RecoveryManager's undo pass on table A's WAL records never touches table B's files") {
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm_a(a_heap, wal, txns, /*table_id=*/0); RecordManager rm_a(pm_a);
+            IndexManager im_a(a_idx, wal, txns, /*table_id=*/0);
+            PageManager pm_b(b_heap, wal, txns, /*table_id=*/1); RecordManager rm_b(pm_b);
+            IndexManager im_b(b_idx, wal, txns, /*table_id=*/1);
+            MVCCManager mvcc(txns);
+            Table ta("a", schema, pm_a, rm_a, im_a, mvcc);
+            Table tb("b", schema, pm_b, rm_b, im_b, mvcc);
+
+            tb.insert({"1"});  // auto-commit -- should survive recovery untouched
+        }
+        {
+            // Table A gets an uncommitted write left dangling -- table B
+            // is never even opened in this scope.
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm_a(a_heap, wal, txns, /*table_id=*/0); RecordManager rm_a(pm_a);
+            IndexManager im_a(a_idx, wal, txns, /*table_id=*/0);
+            MVCCManager mvcc(txns);
+            Table ta("a", schema, pm_a, rm_a, im_a, mvcc);
+            uint64_t txn = ta.beginTxn();
+            ta.insert({"1"}, txn);
+            // no commit
+        }
+        {
+            WALWriter wal(wal_file);
+            std::unordered_map<uint32_t, RecoveryManager::TableFiles> tables{
+                {0u, RecoveryManager::TableFiles{a_heap, a_idx}},
+                {1u, RecoveryManager::TableFiles{b_heap, b_idx}},
+            };
+            RecoveryManager recovery(wal, tables);
+            recovery.run();
+        }
+        {
+            WALWriter wal(wal_file); TransactionManager txns(wal);
+            PageManager pm_a(a_heap, wal, txns, /*table_id=*/0); RecordManager rm_a(pm_a);
+            IndexManager im_a(a_idx, wal, txns, /*table_id=*/0);
+            PageManager pm_b(b_heap, wal, txns, /*table_id=*/1); RecordManager rm_b(pm_b);
+            IndexManager im_b(b_idx, wal, txns, /*table_id=*/1);
+            MVCCManager mvcc(txns);
+            Table ta("a", schema, pm_a, rm_a, im_a, mvcc);
+            Table tb("b", schema, pm_b, rm_b, im_b, mvcc);
+
+            assert(!ta.getByKey("1").has_value());  // table A's uncommitted insert was undone
+            auto b1 = tb.getByKey("1");              // table B's committed row is untouched
+            assert(b1.has_value() && b1->getFields()[0] == "1");
+        }
+    } END_TEST;
+
+    for (const std::string& f : {wal_file, a_heap, a_idx, b_heap, b_idx}) std::remove(f.c_str());
+}
+
+static void test_database() {
+    test_database_two_tables_survive_restart();
+    test_database_crash_spanning_two_tables_undone_atomically();
+    test_recovery_multitable_routing();
+}
+
+// ─── SQL Lexer + Parser (Phase 6 Session 2) ───────────────────────────────────
+
+static std::vector<Token> lex(const std::string& sql) {
+    Lexer lexer(sql);
+    return lexer.tokenize();
+}
+
+static void test_sql_lexer() {
+    TEST("keywords, identifiers, punctuation tokenize correctly and case-insensitively") {
+        auto tokens = lex("select * From users;");
+        assert(tokens.size() == 6);  // 5 tokens + END_OF_INPUT
+        assert(tokens[0].type == SqlTokenType::KEYWORD_SELECT);
+        assert(tokens[1].type == SqlTokenType::STAR);
+        assert(tokens[2].type == SqlTokenType::KEYWORD_FROM);
+        assert(tokens[3].type == SqlTokenType::IDENTIFIER && tokens[3].text == "users");
+        assert(tokens[4].type == SqlTokenType::SEMICOLON);
+        assert(tokens[5].type == SqlTokenType::END_OF_INPUT);
+    } END_TEST;
+
+    TEST("identifier text preserves original case, unlike keywords") {
+        auto tokens = lex("SELECT UserName FROM t;");
+        assert(tokens[1].type == SqlTokenType::IDENTIFIER && tokens[1].text == "UserName");
+    } END_TEST;
+
+    TEST("string literal, including an escaped '' quote") {
+        auto tokens = lex("'it''s here'");
+        assert(tokens[0].type == SqlTokenType::STRING_LITERAL);
+        assert(tokens[0].text == "it's here");
+    } END_TEST;
+
+    TEST("number literal, including a negative one") {
+        auto tokens = lex("42 -7");
+        assert(tokens[0].type == SqlTokenType::NUMBER_LITERAL && tokens[0].text == "42");
+        assert(tokens[1].type == SqlTokenType::NUMBER_LITERAL && tokens[1].text == "-7");
+    } END_TEST;
+
+    TEST("all comparison operators, including <> as an alias for !=") {
+        auto tokens = lex("= != < <= > >= <>");
+        std::vector<SqlTokenType> expected = {
+            SqlTokenType::OP_EQ, SqlTokenType::OP_NEQ, SqlTokenType::OP_LT, SqlTokenType::OP_LTE,
+            SqlTokenType::OP_GT, SqlTokenType::OP_GTE, SqlTokenType::OP_NEQ,
+        };
+        for (std::size_t i = 0; i < expected.size(); i++) assert(tokens[i].type == expected[i]);
+    } END_TEST;
+
+    TEST("a `-- ...` line comment is skipped entirely") {
+        auto tokens = lex("SELECT 1; -- trailing comment\n");
+        assert(tokens.back().type == SqlTokenType::END_OF_INPUT);
+        // no stray tokens from the comment text itself
+        for (auto& t : tokens) assert(t.text.find("trailing") == std::string::npos);
+    } END_TEST;
+
+    TEST("unterminated string literal throws LexError, not a crash") {
+        bool caught = false;
+        try { lex("'never closed"); } catch (const LexError&) { caught = true; }
+        assert(caught);
+    } END_TEST;
+
+    TEST("a lone '!' not followed by '=' throws LexError") {
+        bool caught = false;
+        try { lex("!"); } catch (const LexError&) { caught = true; }
+        assert(caught);
+    } END_TEST;
+
+    TEST("an unrecognized character throws LexError") {
+        bool caught = false;
+        try { lex("@"); } catch (const LexError&) { caught = true; }
+        assert(caught);
+    } END_TEST;
+}
+
+static Stmt parseOne(const std::string& sql) {
+    Parser parser(lex(sql));
+    return parser.parseStatement();
+}
+
+static void test_sql_parser() {
+    TEST("CREATE TABLE with an inert PRIMARY KEY marker on the first column") {
+        auto stmt = parseOne("CREATE TABLE users (id int PRIMARY KEY, name string);");
+        auto& create = std::get<CreateTableStmt>(stmt);
+        assert(create.table_name == "users");
+        assert(create.columns.size() == 2);
+        assert(create.columns[0].name == "id" && create.columns[0].type == "int");
+        assert(create.columns[0].primary_key);
+        assert(create.columns[1].name == "name" && create.columns[1].type == "string");
+        assert(!create.columns[1].primary_key);
+    } END_TEST;
+
+    TEST("PRIMARY KEY on a column other than the first is a parse error") {
+        bool caught = false;
+        try { parseOne("CREATE TABLE t (a int, b int PRIMARY KEY);"); }
+        catch (const ParseError&) { caught = true; }
+        assert(caught);
+    } END_TEST;
+
+    TEST("INSERT INTO ... VALUES parses positional literals in order") {
+        auto stmt = parseOne("INSERT INTO users VALUES ('1', 'Alice');");
+        auto& insert = std::get<InsertStmt>(stmt);
+        assert(insert.table_name == "users");
+        assert(insert.values == std::vector<std::string>({"1", "Alice"}));
+    } END_TEST;
+
+    TEST("SELECT * FROM parses to an empty (meaning 'all columns') projection list") {
+        auto stmt = parseOne("SELECT * FROM users;");
+        auto& select = std::get<SelectStmt>(stmt);
+        assert(select.table_name == "users");
+        assert(select.columns.empty());
+        assert(!select.where.has_value());
+    } END_TEST;
+
+    TEST("SELECT with an explicit column list and a typed WHERE condition") {
+        auto stmt = parseOne("SELECT id, name FROM users WHERE id = 5;");
+        auto& select = std::get<SelectStmt>(stmt);
+        assert(select.columns == std::vector<std::string>({"id", "name"}));
+        assert(select.where.has_value());
+        assert(select.where->column == "id");
+        assert(select.where->op == ComparisonOp::EQ);
+        assert(select.where->literal == "5");
+    } END_TEST;
+
+    TEST("DELETE FROM ... WHERE with a string literal and a non-equality operator") {
+        auto stmt = parseOne("DELETE FROM users WHERE name != 'Bob';");
+        auto& del = std::get<DeleteStmt>(stmt);
+        assert(del.table_name == "users");
+        assert(del.where.has_value());
+        assert(del.where->op == ComparisonOp::NEQ);
+        assert(del.where->literal == "Bob");
+    } END_TEST;
+
+    TEST("UPDATE ... SET with multiple assignments and a WHERE clause") {
+        auto stmt = parseOne("UPDATE users SET name = 'Alice2', age = 31 WHERE id = '1';");
+        auto& update = std::get<UpdateStmt>(stmt);
+        assert(update.table_name == "users");
+        assert(update.assignments.size() == 2);
+        assert(update.assignments[0].column == "name" && update.assignments[0].value == "Alice2");
+        assert(update.assignments[1].column == "age" && update.assignments[1].value == "31");
+        assert(update.where.has_value() && update.where->column == "id");
+    } END_TEST;
+
+    TEST("BEGIN / COMMIT / ROLLBACK parse to their own statement types") {
+        assert(std::holds_alternative<BeginStmt>(parseOne("BEGIN;")));
+        assert(std::holds_alternative<CommitStmt>(parseOne("COMMIT;")));
+        assert(std::holds_alternative<RollbackStmt>(parseOne("ROLLBACK;")));
+    } END_TEST;
+
+    TEST("a statement missing its trailing ';' is a clean parse error, not a crash") {
+        bool caught = false;
+        try { parseOne("SELECT * FROM users"); } catch (const ParseError&) { caught = true; }
+        assert(caught);
+    } END_TEST;
+
+    TEST("unbalanced parentheses in INSERT VALUES is a clean parse error") {
+        bool caught = false;
+        try { parseOne("INSERT INTO t VALUES ('1', '2';"); } catch (const ParseError&) { caught = true; }
+        assert(caught);
+    } END_TEST;
+
+    TEST("a missing FROM in SELECT is a clean parse error") {
+        bool caught = false;
+        try { parseOne("SELECT * users;"); } catch (const ParseError&) { caught = true; }
+        assert(caught);
+    } END_TEST;
+}
+
+// ─── SQL Executor (Phase 6 Session 3) ─────────────────────────────────────────
+
+// Lexes, parses, and executes one statement in one call -- the tests
+// below only care about the resulting QueryResult, not the intermediate
+// token stream or AST (those are covered separately above).
+static QueryResult run(Database& db, uint64_t& txn, const std::string& sql) {
+    Lexer lexer(sql);
+    Parser parser(lexer.tokenize());
+    Stmt stmt = parser.parseStatement();
+    return execute(stmt, db, txn);
+}
+
+static void test_sql_executor_crud() {
+    const std::string dir = "sql_executor_crud";
+    std::filesystem::remove_all(dir);
+
+    TEST("CREATE TABLE, INSERT, SELECT (both '*' and a projection, both PK and scan WHERE), UPDATE, DELETE all work end to end") {
+        Database db(dir);
+        uint64_t txn = 0;
+
+        auto created = run(db, txn, "CREATE TABLE users (id string PRIMARY KEY, name string, age int);");
+        assert(created.ok);
+
+        assert(run(db, txn, "INSERT INTO users VALUES ('1', 'Alice', 30);").ok);
+        assert(run(db, txn, "INSERT INTO users VALUES ('2', 'Bob', 25);").ok);
+        assert(run(db, txn, "INSERT INTO users VALUES ('3', 'Carol', 40);").ok);
+
+        auto all = run(db, txn, "SELECT * FROM users;");
+        assert(all.ok);
+        assert(all.columns == std::vector<std::string>({"id", "name", "age"}));
+        assert(all.rows.size() == 3);
+
+        auto by_pk = run(db, txn, "SELECT name FROM users WHERE id = '2';");
+        assert(by_pk.ok && by_pk.columns == std::vector<std::string>({"name"}));
+        assert(by_pk.rows.size() == 1 && by_pk.rows[0][0] == "Bob");
+
+        auto by_scan = run(db, txn, "SELECT id FROM users WHERE name = 'Carol';");
+        assert(by_scan.ok && by_scan.rows.size() == 1 && by_scan.rows[0][0] == "3");
+
+        auto upd = run(db, txn, "UPDATE users SET age = 26 WHERE id = '2';");
+        assert(upd.ok && upd.affected_rows == 1);
+        auto after_upd = run(db, txn, "SELECT age FROM users WHERE id = '2';");
+        assert(after_upd.rows[0][0] == "26");
+
+        auto del = run(db, txn, "DELETE FROM users WHERE id = '1';");
+        assert(del.ok && del.affected_rows == 1);
+        auto after_del = run(db, txn, "SELECT * FROM users;");
+        assert(after_del.rows.size() == 2);
+    } END_TEST;
+
+    std::filesystem::remove_all(dir);
+}
+
+static void test_sql_executor_typed_where() {
+    const std::string dir = "sql_executor_typed_where";
+    std::filesystem::remove_all(dir);
+
+    TEST("a scanned WHERE on an int column compares numerically, not lexicographically") {
+        Database db(dir);
+        uint64_t txn = 0;
+        run(db, txn, "CREATE TABLE t (id string PRIMARY KEY, age int);");
+        run(db, txn, "INSERT INTO t VALUES ('a', 9);");
+        run(db, txn, "INSERT INTO t VALUES ('b', 10);");
+
+        // Lexicographically, "10" < "9" (since '1' < '9'), so a naive
+        // string compare of `age > 9` would wrongly return nothing.
+        // Numerically, only age=10 qualifies.
+        auto r = run(db, txn, "SELECT id FROM t WHERE age > 9;");
+        assert(r.ok && r.rows.size() == 1 && r.rows[0][0] == "b");
+    } END_TEST;
+
+    std::filesystem::remove_all(dir);
+}
+
+static void test_sql_executor_transactions() {
+    const std::string dir = "sql_executor_txn";
+    std::filesystem::remove_all(dir);
+
+    TEST("BEGIN groups multiple statements; ROLLBACK undoes all of them, COMMIT keeps all of them") {
+        Database db(dir);
+        uint64_t txn = 0;
+        run(db, txn, "CREATE TABLE t (id string PRIMARY KEY);");
+
+        assert(run(db, txn, "BEGIN;").ok);
+        assert(txn != 0);
+        run(db, txn, "INSERT INTO t VALUES ('1');");
+        run(db, txn, "INSERT INTO t VALUES ('2');");
+        assert(run(db, txn, "ROLLBACK;").ok);
+        assert(txn == 0);
+        assert(run(db, txn, "SELECT * FROM t;").rows.empty());
+
+        assert(run(db, txn, "BEGIN;").ok);
+        run(db, txn, "INSERT INTO t VALUES ('1');");
+        run(db, txn, "INSERT INTO t VALUES ('2');");
+        assert(run(db, txn, "COMMIT;").ok);
+        assert(txn == 0);
+        assert(run(db, txn, "SELECT * FROM t;").rows.size() == 2);
+    } END_TEST;
+
+    TEST("COMMIT/ROLLBACK with nothing open, or a nested BEGIN, are clean protocol errors") {
+        Database db(dir + "_protocol");
+        uint64_t txn = 0;
+        assert(!run(db, txn, "COMMIT;").ok);
+        assert(!run(db, txn, "ROLLBACK;").ok);
+
+        assert(run(db, txn, "BEGIN;").ok);
+        assert(!run(db, txn, "BEGIN;").ok);  // already one open
+        assert(run(db, txn, "ROLLBACK;").ok);  // cleanup
+    } END_TEST;
+
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove_all(dir + "_protocol");
+}
+
+// ─── SQL Server (Phase 6 Session 4) ───────────────────────────────────────────
+
+static SOCKET sqlConnect(uint16_t port) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert(s != INVALID_SOCKET);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    int rc = connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    assert(rc == 0);
+    return s;
+}
+
+// Accumulates whatever the server sends back until a short idle window
+// passes with nothing more arriving -- the wire protocol has no
+// length-prefix framing, so this is how a test client (which, unlike the
+// server, knows exactly how many statements it just sent) tells "the
+// full response landed" apart from "still arriving". Waits indefinitely
+// (up to a long safety ceiling) for the *first* byte -- a statement
+// blocked on a row lock can legitimately take a while before any
+// response starts arriving at all, which is exactly what the write-write
+// conflict test below deliberately exercises -- then switches to a short
+// idle timeout once bytes are flowing, to detect the response's end.
+static std::string sqlRecvResponse(SOCKET s) {
+    std::string result;
+    char buf[4096];
+    bool got_any = false;
+    while (true) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(s, &readfds);
+        timeval tv = got_any ? timeval{0, 50000} : timeval{30, 0};  // 50ms once flowing, else 30s ceiling
+        int rc = select(0, &readfds, nullptr, nullptr, &tv);
+        if (rc <= 0) break;
+        int n = recv(s, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        result.append(buf, n);
+        got_any = true;
+    }
+    return result;
+}
+
+static std::string sqlSendAndRecv(SOCKET s, const std::string& sql) {
+    send(s, sql.data(), static_cast<int>(sql.size()), 0);
+    return sqlRecvResponse(s);
+}
+
+static void test_sql_server_basic() {
+    const std::string dir = "sql_server_basic";
+    std::filesystem::remove_all(dir);
+    const uint16_t port = 15501;
+    // Database and SqlServer are scoped to this block so both are fully
+    // destructed (closing every open file handle) before the trailing
+    // remove_all() below runs -- removing the directory while Database's
+    // PageManagers still have files open fails on Windows.
+    {
+    Database db(dir);
+    SqlServer server(db, port);
+    server.start();
+
+    TEST("CREATE/INSERT/SELECT/UPDATE/DELETE over a real TCP connection get well-formed responses") {
+        SOCKET client = sqlConnect(port);
+
+        assert(sqlSendAndRecv(client, "CREATE TABLE users (id string PRIMARY KEY, name string);") ==
+               "OK\n");
+        assert(sqlSendAndRecv(client, "INSERT INTO users VALUES ('1', 'Alice');") ==
+               "OK 1 rows affected\n");
+        assert(sqlSendAndRecv(client, "INSERT INTO users VALUES ('2', 'Bob');") ==
+               "OK 1 rows affected\n");
+
+        assert(sqlSendAndRecv(client, "SELECT * FROM users;") == "id|name\n1|Alice\n2|Bob\nOK 2 rows\n");
+
+        assert(sqlSendAndRecv(client, "UPDATE users SET name = 'Alice2' WHERE id = '1';") ==
+               "OK 1 rows affected\n");
+        assert(sqlSendAndRecv(client, "DELETE FROM users WHERE id = '2';") ==
+               "OK 1 rows affected\n");
+        assert(sqlSendAndRecv(client, "SELECT name FROM users WHERE id = '1';") ==
+               "name\nAlice2\nOK 1 rows\n");
+
+        std::string err = sqlSendAndRecv(client, "SELECT * FROM nonexistent;");
+        assert(err.rfind("ERROR:", 0) == 0);
+
+        closesocket(client);
+    } END_TEST;
+
+    TEST("multiple ';'-terminated statements sent in one packet each get their own response, in order") {
+        SOCKET client = sqlConnect(port);
+        std::string batch =
+            "CREATE TABLE t (id string PRIMARY KEY);"
+            "INSERT INTO t VALUES ('x');"
+            "SELECT * FROM t;";
+        assert(sqlSendAndRecv(client, batch) == "OK\nOK 1 rows affected\nid\nx\nOK 1 rows\n");
+        closesocket(client);
+    } END_TEST;
+
+    TEST("BEGIN/COMMIT over a real connection groups statements atomically, same as the Table API") {
+        SOCKET client = sqlConnect(port);
+        sqlSendAndRecv(client, "CREATE TABLE t2 (id string PRIMARY KEY);");
+
+        assert(sqlSendAndRecv(client, "BEGIN;") == "OK\n");
+        sqlSendAndRecv(client, "INSERT INTO t2 VALUES ('a');");
+        assert(sqlSendAndRecv(client, "COMMIT;") == "OK\n");
+        assert(sqlSendAndRecv(client, "SELECT * FROM t2;") == "id\na\nOK 1 rows\n");
+
+        closesocket(client);
+    } END_TEST;
+
+    server.stop();
+    }  // db, server destructed here -- file handles closed
+    std::filesystem::remove_all(dir);
+}
+
+// ─── SQL Server integration + crash recovery (Phase 6 Session 5) ─────────────
+
+static void test_sql_server_write_write_conflict() {
+    const std::string dir = "sql_server_conflict";
+    std::filesystem::remove_all(dir);
+    const uint16_t port = 15502;
+    {
+    Database db(dir);
+    SqlServer server(db, port);
+    server.start();
+
+    TEST("a write-write conflict between two real SQL connections blocks the second until the first commits, then it chains onto the committed result") {
+        SOCKET a = sqlConnect(port);
+        SOCKET b = sqlConnect(port);
+
+        assert(sqlSendAndRecv(a, "CREATE TABLE t (id string PRIMARY KEY, val string);") == "OK\n");
+        assert(sqlSendAndRecv(a, "INSERT INTO t VALUES ('1', 'orig');") == "OK 1 rows affected\n");
+
+        assert(sqlSendAndRecv(a, "BEGIN;") == "OK\n");
+        assert(sqlSendAndRecv(a, "UPDATE t SET val = 'FromA' WHERE id = '1';") ==
+               "OK 1 rows affected\n");
+        // Connection A now holds the row lock, uncommitted.
+
+        std::atomic<bool> b_done{false};
+        std::string b_response;
+        std::thread writer_b([&] {
+            b_response = sqlSendAndRecv(b, "UPDATE t SET val = 'FromB' WHERE id = '1';");
+            b_done = true;
+        });
+
+        // Give B's request time to actually be received by its
+        // connection thread and block on the row lock, not just "not yet
+        // sent" -- same discipline test_mvcc_lock_integration uses at the
+        // Table API level, just with sockets in between now.
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        assert(!b_done);  // genuinely blocked on A, not racing a stale read
+
+        assert(sqlSendAndRecv(a, "COMMIT;") == "OK\n");
+        writer_b.join();
+        assert(b_done);
+        assert(b_response == "OK 1 rows affected\n");
+
+        assert(sqlSendAndRecv(a, "SELECT val FROM t WHERE id = '1';") == "val\nFromB\nOK 1 rows\n");
+
+        closesocket(a);
+        closesocket(b);
+    } END_TEST;
+
+    server.stop();
+    }
+    std::filesystem::remove_all(dir);
+}
+
+static void test_sql_server_repeatable_read() {
+    const std::string dir = "sql_server_repeatable_read";
+    std::filesystem::remove_all(dir);
+    const uint16_t port = 15503;
+    {
+    Database db(dir);
+    SqlServer server(db, port);
+    server.start();
+
+    TEST("a BEGIN-held connection's snapshot sees no phantoms from a concurrent connection's committed insert, until it commits and re-queries") {
+        SOCKET a = sqlConnect(port);
+        SOCKET b = sqlConnect(port);
+
+        assert(sqlSendAndRecv(a, "CREATE TABLE t (id string PRIMARY KEY, val string);") == "OK\n");
+        assert(sqlSendAndRecv(a, "INSERT INTO t VALUES ('1', 'x');") == "OK 1 rows affected\n");
+
+        assert(sqlSendAndRecv(a, "BEGIN;") == "OK\n");
+        assert(sqlSendAndRecv(a, "SELECT * FROM t;") == "id|val\n1|x\nOK 1 rows\n");  // takes A's snapshot
+
+        // A separate, auto-commit connection inserts and commits a new
+        // row entirely outside A's still-open transaction.
+        assert(sqlSendAndRecv(b, "INSERT INTO t VALUES ('2', 'y');") == "OK 1 rows affected\n");
+
+        // Still within A's original transaction: repeatable read means
+        // the new row must stay invisible even though it's since
+        // committed -- A's snapshot never moves.
+        assert(sqlSendAndRecv(a, "SELECT * FROM t;") == "id|val\n1|x\nOK 1 rows\n");
+
+        assert(sqlSendAndRecv(a, "COMMIT;") == "OK\n");
+        // A fresh (auto-commit) statement on the same connection takes a
+        // brand-new snapshot and does see it.
+        assert(sqlSendAndRecv(a, "SELECT * FROM t;") == "id|val\n1|x\n2|y\nOK 2 rows\n");
+
+        closesocket(a);
+        closesocket(b);
+    } END_TEST;
+
+    server.stop();
+    }
+    std::filesystem::remove_all(dir);
+}
+
+static void test_sql_crash_recovery() {
+    const std::string dir = "sql_crash_recovery";
+    std::filesystem::remove_all(dir);
+
+    TEST("CREATE TABLE + data on two tables, all issued via SQL, survives a process restart") {
+        {
+            Database db(dir);
+            uint64_t txn = 0;
+            assert(run(db, txn, "CREATE TABLE users (id string PRIMARY KEY, name string);").ok);
+            assert(run(db, txn, "CREATE TABLE products (sku string PRIMARY KEY, price int);").ok);
+            assert(run(db, txn, "INSERT INTO users VALUES ('1', 'Alice');").ok);
+            assert(run(db, txn, "INSERT INTO products VALUES ('a1', 100);").ok);
+        }  // Database destructed -- simulates a clean process exit
+        {
+            Database db(dir);  // recovery runs here, in the constructor
+            uint64_t txn = 0;
+            auto users = run(db, txn, "SELECT * FROM users;");
+            assert(users.ok && users.rows.size() == 1 && users.rows[0][1] == "Alice");
+            auto products = run(db, txn, "SELECT * FROM products;");
+            assert(products.ok && products.rows.size() == 1 && products.rows[0][1] == "100");
+        }
+    } END_TEST;
+
+    std::filesystem::remove_all(dir);
+}
+
+static void test_sql() {
+    test_sql_lexer();
+    test_sql_parser();
+    test_sql_executor_crud();
+    test_sql_executor_typed_where();
+    test_sql_executor_transactions();
+    test_sql_server_basic();
+    test_sql_server_write_write_conflict();
+    test_sql_server_repeatable_read();
+    test_sql_crash_recovery();
 }
 
 // ─── MVCC (Phase 5) ────────────────────────────────────────────────────────
@@ -1120,7 +1798,8 @@ static void test_mvcc_txn_grouping() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
 
             // Two Table::insert calls (each touching both the heap page
             // and the index) sharing ONE caller-owned txn_id -- before
@@ -1145,7 +1824,8 @@ static void test_mvcc_txn_grouping() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             assert(!t.getByKey("1").has_value());
             assert(!t.getByKey("2").has_value());
         }
@@ -1155,7 +1835,8 @@ static void test_mvcc_txn_grouping() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
 
             uint64_t txn = t.beginTxn();
             t.insert({"3", "Carol"}, txn);
@@ -1171,7 +1852,8 @@ static void test_mvcc_txn_grouping() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             auto a = t.getByKey("3");
             auto b = t.getByKey("4");
             assert(a.has_value() && a->getFields()[1] == "Carol");
@@ -1194,7 +1876,8 @@ static void test_mvcc_visibility() {
     WALWriter wal(wal_file); TransactionManager txns(wal);
     PageManager pm(data_file, wal, txns); RecordManager rm(pm);
     IndexManager im(index_file, wal, txns);
-    Table t("users", schema, pm, rm, im);
+    MVCCManager mvcc(txns);
+    Table t("users", schema, pm, rm, im, mvcc);
 
     TEST("a transaction sees its own uncommitted write, but no one else does yet") {
         uint64_t txn = t.beginTxn();
@@ -1316,14 +1999,16 @@ static void test_mvcc_crash_recovery_versioning() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             t.insert({"1", "Original"});  // auto-commit, survives on its own
         }
         {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             uint64_t txn = t.beginTxn();
             assert(t.updateByKey("1", {"1", "Uncommitted"}, txn));
             // No commitTxn -- simulates a crash mid-transaction. Both the
@@ -1340,7 +2025,8 @@ static void test_mvcc_crash_recovery_versioning() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             auto r = t.getByKey("1");
             assert(r.has_value() && r->getFields()[1] == "Original");
         }
@@ -1351,7 +2037,8 @@ static void test_mvcc_crash_recovery_versioning() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             uint64_t txn = t.beginTxn();
             assert(t.updateByKey("1", {"1", "Committed"}, txn));
             t.commitTxn(txn);
@@ -1365,7 +2052,8 @@ static void test_mvcc_crash_recovery_versioning() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             auto r = t.getByKey("1");
             assert(r.has_value() && r->getFields()[1] == "Committed");
         }
@@ -1511,7 +2199,8 @@ static void test_mvcc_lock_integration() {
     WALWriter wal(wal_file); TransactionManager txns(wal);
     PageManager pm(data_file, wal, txns); RecordManager rm(pm);
     IndexManager im(index_file, wal, txns);
-    Table t("users", schema, pm, rm, im);
+    MVCCManager mvcc(txns);
+    Table t("users", schema, pm, rm, im, mvcc);
 
     TEST("a concurrent writer genuinely blocks on Table's own lock, then correctly builds on the committed result") {
         t.insert({"1", "Original"});  // auto-commit
@@ -1571,7 +2260,8 @@ static void test_mvcc_crash_recovery_mixed_ops() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             t.insert({"1", "Alice"});
             t.insert({"2", "Bob"});
         }
@@ -1579,7 +2269,8 @@ static void test_mvcc_crash_recovery_mixed_ops() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             uint64_t txn = t.beginTxn();
             t.insert({"3", "Carol"}, txn);
             assert(t.updateByKey("1", {"1", "AliceV2"}, txn));
@@ -1596,7 +2287,8 @@ static void test_mvcc_crash_recovery_mixed_ops() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             auto a = t.getByKey("1");
             assert(a.has_value() && a->getFields()[1] == "Alice");  // update undone
             assert(t.getByKey("2").has_value());                    // delete undone
@@ -1618,7 +2310,8 @@ static void test_mvcc_crash_recovery_mixed_ops() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("users", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("users", schema, pm, rm, im, mvcc);
             auto a = t.getByKey("1");
             assert(a.has_value() && a->getFields()[1] == "AliceV2");
             assert(!t.getByKey("2").has_value());
@@ -1656,7 +2349,8 @@ static void test_mvcc_stress_mixed_concurrent() {
             WALWriter wal(wal_file); TransactionManager txns(wal);
             PageManager pm(data_file, wal, txns); RecordManager rm(pm);
             IndexManager im(index_file, wal, txns);
-            Table t("stress", schema, pm, rm, im);
+            MVCCManager mvcc(txns);
+            Table t("stress", schema, pm, rm, im, mvcc);
 
             auto ownedKey = [](int i) { return "k" + std::to_string(i); };
             auto newKey = [](int writer, int i) {
@@ -2326,6 +3020,12 @@ int main() {
 
     std::cout << "=== Table ===\n";
     test_table_basic(); test_table_delete(); test_table_insert_mismatch(); test_table_restart();
+
+    std::cout << "=== Database (Phase 6 Session 1: multi-table storage) ===\n";
+    test_database();
+
+    std::cout << "=== SQL Frontend (Phase 6) ===\n";
+    test_sql();
 
     std::cout << "=== MVCC (Phase 5) ===\n";
     test_mvcc();

@@ -69,6 +69,7 @@ std::vector<char> serializeRecord(const WALRecord& r) {
     appendUint64(buf, r.txn_id);
     appendUint8(buf, static_cast<uint8_t>(r.type));
     appendUint8(buf, static_cast<uint8_t>(r.store));
+    appendUint32(buf, r.table_id);
     appendInt32(buf, r.page_id);
     appendBytes(buf, r.old_data);
     appendBytes(buf, r.new_data);
@@ -101,6 +102,12 @@ bool deserializeRecord(const std::vector<char>& buf, WALRecord& out) {
         offset += sizeof(v);
         return true;
     };
+    auto readUint32 = [&](uint32_t& v) -> bool {
+        if (remaining() < sizeof(v)) return false;
+        std::memcpy(&v, buf.data() + offset, sizeof(v));
+        offset += sizeof(v);
+        return true;
+    };
     auto readBytes = [&](std::vector<char>& v) -> bool {
         uint32_t len;
         if (remaining() < sizeof(len)) return false;
@@ -118,6 +125,7 @@ bool deserializeRecord(const std::vector<char>& buf, WALRecord& out) {
     if (!readUint64(out.txn_id)) return false;
     if (!readUint8(type_tag)) return false;
     if (!readUint8(store_tag)) return false;
+    if (!readUint32(out.table_id)) return false;
     if (!readInt32(out.page_id)) return false;
     if (!readBytes(out.old_data)) return false;
     if (!readBytes(out.new_data)) return false;
@@ -334,7 +342,7 @@ uint64_t TransactionManager::peekNextTxnId() const {
 
 uint64_t TransactionManager::appendRecord(uint64_t txn_id, WALRecordType type, WALStore store,
                                            int32_t page_id, std::vector<char> old_data,
-                                           std::vector<char> new_data) {
+                                           std::vector<char> new_data, uint32_t table_id) {
     std::lock_guard<std::mutex> lock(mu);
     uint64_t prev_lsn = last_lsn_per_txn.count(txn_id) ? last_lsn_per_txn[txn_id] : 0;
 
@@ -342,6 +350,7 @@ uint64_t TransactionManager::appendRecord(uint64_t txn_id, WALRecordType type, W
     record.txn_id = txn_id;
     record.type = type;
     record.store = store;
+    record.table_id = table_id;
     record.page_id = page_id;
     record.old_data = std::move(old_data);
     record.new_data = std::move(new_data);

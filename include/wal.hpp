@@ -25,6 +25,12 @@ struct WALRecord {
     uint64_t txn_id = 0;
     WALRecordType type = WALRecordType::BEGIN;
     WALStore store = WALStore::HEAP;
+    // Which table's heap/index file `store`+`page_id` refers to (Phase 6:
+    // multiple tables now share one WAL/LSN/txn_id space, so `store` alone
+    // no longer identifies a physical file). 0 for BEGIN/COMMIT/ABORT,
+    // which are table-agnostic, and for every pre-Phase-6 single-table
+    // caller, which never set it and doesn't need to.
+    uint32_t table_id = 0;
     int32_t page_id = -1;
     std::vector<char> old_data;
     std::vector<char> new_data;
@@ -94,10 +100,13 @@ public:
     void abort(uint64_t txn_id);
 
     // Appends an UPDATE/CLR-style record for this txn, threading
-    // prev_lsn automatically from the txn's last record.
+    // prev_lsn automatically from the txn's last record. table_id
+    // defaults to 0 -- every pre-Phase-6 caller has exactly one table
+    // (implicitly table_id 0), so this stays source-compatible with
+    // every existing call site.
     uint64_t appendRecord(uint64_t txn_id, WALRecordType type, WALStore store,
                            int32_t page_id, std::vector<char> old_data,
-                           std::vector<char> new_data);
+                           std::vector<char> new_data, uint32_t table_id = 0);
 
     // The txn_id that WOULD be assigned to the next begin() call, without
     // actually allocating one. MVCCManager (Phase 5) uses this as a

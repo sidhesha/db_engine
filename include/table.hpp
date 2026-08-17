@@ -6,6 +6,7 @@
 #include "recordmanager.hpp"
 #include "indexmanager.hpp"
 #include "mvcc.hpp"
+#include "key.hpp"
 
 class Table {
 public:
@@ -14,8 +15,18 @@ public:
     // Table used to default-construct an in-memory-only BPlusTree here,
     // which meant every index write silently bypassed all of Phases
     // 1-4's persistence/durability work; this wires it to the real one.
+    //
+    // mvcc is a reference, not an owned member (Phase 6): once multiple
+    // tables can share one TransactionManager/WAL (Database), they must
+    // also share one MVCCManager -- its in-memory transaction status and
+    // snapshot bookkeeping (and the LockManager nested inside it) has to
+    // be visible to every table a connection's transaction touches, not
+    // duplicated per table. Before Phase 6, each Table had its own
+    // isolated TransactionManager anyway, so this was equivalent to
+    // owning one; now the caller (a Database, or a test wiring up a
+    // single table exactly as before) owns it instead.
     Table(const std::string& name, const Schema& schema, PageManager& pm,
-          RecordManager& rm, IndexManager& im);
+          RecordManager& rm, IndexManager& im, MVCCManager& mvcc);
 
     // Multi-statement transactions: begin, do several insert/updateByKey/
     // deleteByKey/getByKey calls passing the returned id as txn_id, then
@@ -51,6 +62,14 @@ public:
     // visible to txn_id's snapshot (see MVCCManager::isVisible), or falls
     // off the end of the chain.
     std::optional<Record> getByKey(const std::string& key, uint64_t txn_id = 0);
+    // Full-table scan (Phase 6: SQL SELECT/UPDATE/DELETE with a WHERE
+    // condition on a non-primary-key column has no index to use, so it
+    // needs every visible row). One entry per key currently in the
+    // index, using the exact same version-chain walk getByKey does (see
+    // findVisibleVersion) -- a key whose current version isn't visible to
+    // txn_id's snapshot is simply omitted, not returned as a "deleted"
+    // marker.
+    std::vector<std::pair<Key, Record>> scanAll(uint64_t txn_id = 0);
 
     const std::string& getName() const;
     const Schema& getSchema() const;
@@ -67,5 +86,13 @@ private:
     RecordManager& record_manager;
     PageManager& page_manager;
     BPlusTree index;
-    MVCCManager mvcc;
+    // Reference (see the constructor comment): shared across every Table
+    // in the same Database so transaction/snapshot state and row locks
+    // are visible engine-wide, not just within one table.
+    MVCCManager& mvcc;
+
+    // Shared by getByKey() and scanAll(): walks the version chain
+    // starting at start_rid until it finds a version isVisible() to
+    // txn_id under `snapshot`, or falls off the end.
+    std::optional<Record> findVisibleVersion(RID start_rid, uint64_t txn_id, const Snapshot& snapshot);
 };

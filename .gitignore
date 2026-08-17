@@ -1,4 +1,7 @@
 /build/
 .cache/
 *.db
+*.wal
+*.idx
+*.heap
 test_catalog.txt

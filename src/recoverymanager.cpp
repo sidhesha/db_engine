@@ -17,7 +17,10 @@ constexpr std::size_t INDEX_LSN_OFFSET = 12;
 
 RecoveryManager::RecoveryManager(WALWriter& wal, const std::string& heap_filename,
                                   const std::string& index_filename)
-    : wal(wal), heap_filename(heap_filename), index_filename(index_filename) {}
+    : wal(wal), tables{{0u, TableFiles{heap_filename, index_filename}}} {}
+
+RecoveryManager::RecoveryManager(WALWriter& wal, std::unordered_map<uint32_t, TableFiles> tables)
+    : wal(wal), tables(std::move(tables)) {}
 
 std::size_t RecoveryManager::heapOffset(int page_id) const {
     return static_cast<std::size_t>(page_id) * PAGE_SIZE;
@@ -90,12 +93,20 @@ void RecoveryManager::run() {
     auto records = wal.readAll();
     if (records.empty()) return;
 
-    std::fstream heap_file, index_file;
-    ensureOpen(heap_file, heap_filename);
-    ensureOpen(index_file, index_filename);
+    std::unordered_map<uint32_t, std::fstream> heap_files, index_files;
+    for (auto& [table_id, files] : tables) {
+        ensureOpen(heap_files[table_id], files.heap_filename);
+        ensureOpen(index_files[table_id], files.index_filename);
+    }
 
-    auto fileFor = [&](WALStore store) -> std::fstream& {
-        return store == WALStore::HEAP ? heap_file : index_file;
+    auto fileFor = [&](uint32_t table_id, WALStore store) -> std::fstream& {
+        auto& by_table = (store == WALStore::HEAP) ? heap_files : index_files;
+        auto it = by_table.find(table_id);
+        if (it == by_table.end()) {
+            throw std::runtime_error(
+                "RecoveryManager: WAL references unknown table_id " + std::to_string(table_id));
+        }
+        return it->second;
     };
     auto offsetFor = [&](WALStore store, int page_id) -> std::size_t {
         return store == WALStore::HEAP ? heapOffset(page_id) : indexOffset(page_id);
@@ -105,7 +116,7 @@ void RecoveryManager::run() {
     for (auto& r : records) {
         if (r.type != WALRecordType::UPDATE && r.type != WALRecordType::CLR) continue;
 
-        std::fstream& file = fileFor(r.store);
+        std::fstream& file = fileFor(r.table_id, r.store);
         std::size_t offset = offsetFor(r.store, r.page_id);
         std::size_t lsn_offset = lsnFieldOffset(r.store);
 
@@ -177,7 +188,7 @@ void RecoveryManager::run() {
                     std::memcpy(patched.data() + lsn_offset, &clr_lsn, sizeof(clr_lsn));
                 }
 
-                writePageBytes(fileFor(r->store), offsetFor(r->store, r->page_id), patched);
+                writePageBytes(fileFor(r->table_id, r->store), offsetFor(r->store, r->page_id), patched);
             }
             // r->type == CLR: this step was already undone in an earlier
             // recovery run -- nothing to (re)apply, just keep walking back.
@@ -187,6 +198,6 @@ void RecoveryManager::run() {
     }
 
     wal.flush();
-    heap_file.flush();
-    index_file.flush();
+    for (auto& [id, f] : heap_files) { (void)id; f.flush(); }
+    for (auto& [id, f] : index_files) { (void)id; f.flush(); }
 }
