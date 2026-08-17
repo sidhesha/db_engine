@@ -4,8 +4,8 @@
 #include <string>
 #include <vector>
 
-#include "ast.hpp"
-#include "lexer.hpp"
+#include "db_engine/ast.hpp"
+#include "db_engine/lexer.hpp"
 
 class ParseError : public std::runtime_error {
 public:

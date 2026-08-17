@@ -4,13 +4,13 @@
 #include <string>
 #include <unordered_map>
 
-#include "catalogmanager.hpp"
-#include "indexmanager.hpp"
-#include "mvcc.hpp"
-#include "pagemanager.hpp"
-#include "recordmanager.hpp"
-#include "table.hpp"
-#include "wal.hpp"
+#include "db_engine/catalogmanager.hpp"
+#include "db_engine/indexmanager.hpp"
+#include "db_engine/mvcc.hpp"
+#include "db_engine/pagemanager.hpp"
+#include "db_engine/recordmanager.hpp"
+#include "db_engine/table.hpp"
+#include "db_engine/wal.hpp"
 
 // Owns everything a multi-table engine needs: one shared WAL/
 // TransactionManager/MVCCManager (Phase 6) so a transaction spanning more

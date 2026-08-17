@@ -1,6 +1,6 @@
 #pragma once
 
-#include "Schema.hpp"
+#include "db_engine/schema.hpp"
 #include <cstdint>
 #include <unordered_map>
 #include <string>

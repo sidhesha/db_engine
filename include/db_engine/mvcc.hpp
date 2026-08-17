@@ -2,9 +2,9 @@
 
 #include <mutex>
 #include <unordered_map>
-#include "lockmanager.hpp"
-#include "transaction.hpp"
-#include "wal.hpp"
+#include "db_engine/lockmanager.hpp"
+#include "db_engine/transaction.hpp"
+#include "db_engine/wal.hpp"
 
 // Owns in-memory transaction status + snapshot bookkeeping and the
 // row-version visibility rule built on top of it. Layered on top of

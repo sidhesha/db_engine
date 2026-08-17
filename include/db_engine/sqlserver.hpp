@@ -19,8 +19,8 @@
 #include <thread>
 #include <vector>
 
-#include "database.hpp"
-#include "executor.hpp"
+#include "db_engine/database.hpp"
+#include "db_engine/executor.hpp"
 
 // Winsock2-based TCP server (this project targets MinGW/UCRT64 on
 // Windows -- no need for a cross-platform socket abstraction). Accepts

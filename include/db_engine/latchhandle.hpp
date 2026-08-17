@@ -1,7 +1,7 @@
 #pragma once
 #include <memory>
 #include <utility>
-#include "node.hpp"
+#include "db_engine/node.hpp"
 
 // RAII ownership of a latch on a specific node. Exception-safe (always
 // releases on destruction unless moved-from or explicitly released) and

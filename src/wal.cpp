@@ -1,4 +1,4 @@
-#include "wal.hpp"
+#include "db_engine/wal.hpp"
 
 #include <array>
 #include <cstring>

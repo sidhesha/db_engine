@@ -1,8 +1,8 @@
 #pragma once
 
-#include "page.hpp"
-#include "wal.hpp"
-#include "evictionpolicy.hpp"
+#include "db_engine/page.hpp"
+#include "db_engine/wal.hpp"
+#include "db_engine/evictionpolicy.hpp"
 #include <string>
 #include <vector>
 #include <fstream>

@@ -1,10 +1,10 @@
-#include "recoverymanager.hpp"
+#include "db_engine/recoverymanager.hpp"
 
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include "constants.hpp"
+#include "db_engine/constants.hpp"
 
 namespace {
 // Mirrors Page's header layout (include/page.hpp, src/page.cpp): 4 bytes
