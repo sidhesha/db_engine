@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-enum class TokenType {
+enum class SqlTokenType {
     KEYWORD_CREATE, KEYWORD_TABLE, KEYWORD_INSERT, KEYWORD_INTO, KEYWORD_VALUES,
     KEYWORD_SELECT, KEYWORD_FROM, KEYWORD_WHERE, KEYWORD_DELETE, KEYWORD_UPDATE,
     KEYWORD_SET, KEYWORD_BEGIN, KEYWORD_COMMIT, KEYWORD_ROLLBACK,
@@ -17,7 +17,7 @@ enum class TokenType {
 };
 
 struct Token {
-    TokenType type;
+    SqlTokenType type;
     std::string text;   // original text (identifiers/literals keep their case; keywords normalized upper)
     std::size_t pos;     // byte offset into the source, for error messages
 };

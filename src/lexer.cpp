@@ -4,16 +4,16 @@
 #include <unordered_map>
 
 namespace {
-const std::unordered_map<std::string, TokenType>& keywordTable() {
-    static const std::unordered_map<std::string, TokenType> table = {
-        {"CREATE", TokenType::KEYWORD_CREATE}, {"TABLE", TokenType::KEYWORD_TABLE},
-        {"INSERT", TokenType::KEYWORD_INSERT}, {"INTO", TokenType::KEYWORD_INTO},
-        {"VALUES", TokenType::KEYWORD_VALUES}, {"SELECT", TokenType::KEYWORD_SELECT},
-        {"FROM", TokenType::KEYWORD_FROM}, {"WHERE", TokenType::KEYWORD_WHERE},
-        {"DELETE", TokenType::KEYWORD_DELETE}, {"UPDATE", TokenType::KEYWORD_UPDATE},
-        {"SET", TokenType::KEYWORD_SET}, {"BEGIN", TokenType::KEYWORD_BEGIN},
-        {"COMMIT", TokenType::KEYWORD_COMMIT}, {"ROLLBACK", TokenType::KEYWORD_ROLLBACK},
-        {"PRIMARY", TokenType::KEYWORD_PRIMARY}, {"KEY", TokenType::KEYWORD_KEY},
+const std::unordered_map<std::string, SqlTokenType>& keywordTable() {
+    static const std::unordered_map<std::string, SqlTokenType> table = {
+        {"CREATE", SqlTokenType::KEYWORD_CREATE}, {"TABLE", SqlTokenType::KEYWORD_TABLE},
+        {"INSERT", SqlTokenType::KEYWORD_INSERT}, {"INTO", SqlTokenType::KEYWORD_INTO},
+        {"VALUES", SqlTokenType::KEYWORD_VALUES}, {"SELECT", SqlTokenType::KEYWORD_SELECT},
+        {"FROM", SqlTokenType::KEYWORD_FROM}, {"WHERE", SqlTokenType::KEYWORD_WHERE},
+        {"DELETE", SqlTokenType::KEYWORD_DELETE}, {"UPDATE", SqlTokenType::KEYWORD_UPDATE},
+        {"SET", SqlTokenType::KEYWORD_SET}, {"BEGIN", SqlTokenType::KEYWORD_BEGIN},
+        {"COMMIT", SqlTokenType::KEYWORD_COMMIT}, {"ROLLBACK", SqlTokenType::KEYWORD_ROLLBACK},
+        {"PRIMARY", SqlTokenType::KEYWORD_PRIMARY}, {"KEY", SqlTokenType::KEYWORD_KEY},
     };
     return table;
 }
@@ -59,14 +59,14 @@ Token Lexer::lexIdentifierOrKeyword() {
     if (it != keywordTable().end()) {
         return Token{it->second, upper, start};
     }
-    return Token{TokenType::IDENTIFIER, text, start};
+    return Token{SqlTokenType::IDENTIFIER, text, start};
 }
 
 Token Lexer::lexNumber() {
     std::size_t start = pos;
     if (peek() == '-') advance();
     while (!atEnd() && std::isdigit(static_cast<unsigned char>(peek()))) advance();
-    return Token{TokenType::NUMBER_LITERAL, source.substr(start, pos - start), start};
+    return Token{SqlTokenType::NUMBER_LITERAL, source.substr(start, pos - start), start};
 }
 
 Token Lexer::lexString() {
@@ -88,7 +88,7 @@ Token Lexer::lexString() {
         }
         value.push_back(c);
     }
-    return Token{TokenType::STRING_LITERAL, value, start};
+    return Token{SqlTokenType::STRING_LITERAL, value, start};
 }
 
 std::vector<Token> Lexer::tokenize() {
@@ -96,7 +96,7 @@ std::vector<Token> Lexer::tokenize() {
     while (true) {
         skipWhitespaceAndComments();
         if (atEnd()) {
-            tokens.push_back(Token{TokenType::END_OF_INPUT, "", pos});
+            tokens.push_back(Token{SqlTokenType::END_OF_INPUT, "", pos});
             break;
         }
 
@@ -112,36 +112,36 @@ std::vector<Token> Lexer::tokenize() {
             tokens.push_back(lexString());
         } else if (c == '=') {
             advance();
-            tokens.push_back(Token{TokenType::OP_EQ, "=", start});
+            tokens.push_back(Token{SqlTokenType::OP_EQ, "=", start});
         } else if (c == '<') {
             advance();
-            if (peek() == '=') { advance(); tokens.push_back(Token{TokenType::OP_LTE, "<=", start}); }
-            else if (peek() == '>') { advance(); tokens.push_back(Token{TokenType::OP_NEQ, "<>", start}); }
-            else { tokens.push_back(Token{TokenType::OP_LT, "<", start}); }
+            if (peek() == '=') { advance(); tokens.push_back(Token{SqlTokenType::OP_LTE, "<=", start}); }
+            else if (peek() == '>') { advance(); tokens.push_back(Token{SqlTokenType::OP_NEQ, "<>", start}); }
+            else { tokens.push_back(Token{SqlTokenType::OP_LT, "<", start}); }
         } else if (c == '>') {
             advance();
-            if (peek() == '=') { advance(); tokens.push_back(Token{TokenType::OP_GTE, ">=", start}); }
-            else { tokens.push_back(Token{TokenType::OP_GT, ">", start}); }
+            if (peek() == '=') { advance(); tokens.push_back(Token{SqlTokenType::OP_GTE, ">=", start}); }
+            else { tokens.push_back(Token{SqlTokenType::OP_GT, ">", start}); }
         } else if (c == '!') {
             advance();
             if (peek() != '=') throw LexError("expected '=' after '!'", start);
             advance();
-            tokens.push_back(Token{TokenType::OP_NEQ, "!=", start});
+            tokens.push_back(Token{SqlTokenType::OP_NEQ, "!=", start});
         } else if (c == ',') {
             advance();
-            tokens.push_back(Token{TokenType::COMMA, ",", start});
+            tokens.push_back(Token{SqlTokenType::COMMA, ",", start});
         } else if (c == '(') {
             advance();
-            tokens.push_back(Token{TokenType::LPAREN, "(", start});
+            tokens.push_back(Token{SqlTokenType::LPAREN, "(", start});
         } else if (c == ')') {
             advance();
-            tokens.push_back(Token{TokenType::RPAREN, ")", start});
+            tokens.push_back(Token{SqlTokenType::RPAREN, ")", start});
         } else if (c == '*') {
             advance();
-            tokens.push_back(Token{TokenType::STAR, "*", start});
+            tokens.push_back(Token{SqlTokenType::STAR, "*", start});
         } else if (c == ';') {
             advance();
-            tokens.push_back(Token{TokenType::SEMICOLON, ";", start});
+            tokens.push_back(Token{SqlTokenType::SEMICOLON, ";", start});
         } else {
             throw LexError(std::string("unrecognized character '") + c + "'", start);
         }

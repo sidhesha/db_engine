@@ -30,8 +30,8 @@ private:
 
     const Token& peek() const;
     const Token& advance();
-    const Token& expect(TokenType type, const std::string& what);
-    bool check(TokenType type) const;
+    const Token& expect(SqlTokenType type, const std::string& what);
+    bool check(SqlTokenType type) const;
 
     CreateTableStmt parseCreateTable();
     InsertStmt parseInsert();

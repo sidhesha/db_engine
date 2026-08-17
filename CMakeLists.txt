@@ -36,10 +36,13 @@ set(SOURCES
     src/lexer.cpp
     src/parser.cpp
     src/executor.cpp
+    src/sqlserver.cpp
 )
 
 # Main executable
 add_executable(db_engine main.cpp ${SOURCES})
+target_link_libraries(db_engine ws2_32)
 
 # Test executable
 add_executable(db_engine_test test.cpp ${SOURCES})
+target_link_libraries(db_engine_test ws2_32)

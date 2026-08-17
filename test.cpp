@@ -27,6 +27,7 @@
 #include "lexer.hpp"
 #include "parser.hpp"
 #include "executor.hpp"
+#include "sqlserver.hpp"
 
 static int passed = 0;
 static int failed = 0;
@@ -1269,43 +1270,43 @@ static void test_sql_lexer() {
     TEST("keywords, identifiers, punctuation tokenize correctly and case-insensitively") {
         auto tokens = lex("select * From users;");
         assert(tokens.size() == 6);  // 5 tokens + END_OF_INPUT
-        assert(tokens[0].type == TokenType::KEYWORD_SELECT);
-        assert(tokens[1].type == TokenType::STAR);
-        assert(tokens[2].type == TokenType::KEYWORD_FROM);
-        assert(tokens[3].type == TokenType::IDENTIFIER && tokens[3].text == "users");
-        assert(tokens[4].type == TokenType::SEMICOLON);
-        assert(tokens[5].type == TokenType::END_OF_INPUT);
+        assert(tokens[0].type == SqlTokenType::KEYWORD_SELECT);
+        assert(tokens[1].type == SqlTokenType::STAR);
+        assert(tokens[2].type == SqlTokenType::KEYWORD_FROM);
+        assert(tokens[3].type == SqlTokenType::IDENTIFIER && tokens[3].text == "users");
+        assert(tokens[4].type == SqlTokenType::SEMICOLON);
+        assert(tokens[5].type == SqlTokenType::END_OF_INPUT);
     } END_TEST;
 
     TEST("identifier text preserves original case, unlike keywords") {
         auto tokens = lex("SELECT UserName FROM t;");
-        assert(tokens[1].type == TokenType::IDENTIFIER && tokens[1].text == "UserName");
+        assert(tokens[1].type == SqlTokenType::IDENTIFIER && tokens[1].text == "UserName");
     } END_TEST;
 
     TEST("string literal, including an escaped '' quote") {
         auto tokens = lex("'it''s here'");
-        assert(tokens[0].type == TokenType::STRING_LITERAL);
+        assert(tokens[0].type == SqlTokenType::STRING_LITERAL);
         assert(tokens[0].text == "it's here");
     } END_TEST;
 
     TEST("number literal, including a negative one") {
         auto tokens = lex("42 -7");
-        assert(tokens[0].type == TokenType::NUMBER_LITERAL && tokens[0].text == "42");
-        assert(tokens[1].type == TokenType::NUMBER_LITERAL && tokens[1].text == "-7");
+        assert(tokens[0].type == SqlTokenType::NUMBER_LITERAL && tokens[0].text == "42");
+        assert(tokens[1].type == SqlTokenType::NUMBER_LITERAL && tokens[1].text == "-7");
     } END_TEST;
 
     TEST("all comparison operators, including <> as an alias for !=") {
         auto tokens = lex("= != < <= > >= <>");
-        std::vector<TokenType> expected = {
-            TokenType::OP_EQ, TokenType::OP_NEQ, TokenType::OP_LT, TokenType::OP_LTE,
-            TokenType::OP_GT, TokenType::OP_GTE, TokenType::OP_NEQ,
+        std::vector<SqlTokenType> expected = {
+            SqlTokenType::OP_EQ, SqlTokenType::OP_NEQ, SqlTokenType::OP_LT, SqlTokenType::OP_LTE,
+            SqlTokenType::OP_GT, SqlTokenType::OP_GTE, SqlTokenType::OP_NEQ,
         };
         for (std::size_t i = 0; i < expected.size(); i++) assert(tokens[i].type == expected[i]);
     } END_TEST;
 
     TEST("a `-- ...` line comment is skipped entirely") {
         auto tokens = lex("SELECT 1; -- trailing comment\n");
-        assert(tokens.back().type == TokenType::END_OF_INPUT);
+        assert(tokens.back().type == SqlTokenType::END_OF_INPUT);
         // no stray tokens from the comment text itself
         for (auto& t : tokens) assert(t.text.find("trailing") == std::string::npos);
     } END_TEST;
@@ -1536,12 +1537,119 @@ static void test_sql_executor_transactions() {
     std::filesystem::remove_all(dir + "_protocol");
 }
 
+// ─── SQL Server (Phase 6 Session 4) ───────────────────────────────────────────
+
+static SOCKET sqlConnect(uint16_t port) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    assert(s != INVALID_SOCKET);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    int rc = connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+    assert(rc == 0);
+    return s;
+}
+
+// Accumulates whatever the server sends back until a short idle window
+// passes with nothing more arriving -- the wire protocol has no
+// length-prefix framing, so this is how a test client (which, unlike the
+// server, knows exactly how many statements it just sent) tells "the
+// full response landed" apart from "still arriving".
+static std::string sqlRecvResponse(SOCKET s) {
+    std::string result;
+    char buf[4096];
+    while (true) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(s, &readfds);
+        timeval tv{0, 50000};  // 50ms
+        int rc = select(0, &readfds, nullptr, nullptr, &tv);
+        if (rc <= 0) break;
+        int n = recv(s, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        result.append(buf, n);
+    }
+    return result;
+}
+
+static std::string sqlSendAndRecv(SOCKET s, const std::string& sql) {
+    send(s, sql.data(), static_cast<int>(sql.size()), 0);
+    return sqlRecvResponse(s);
+}
+
+static void test_sql_server_basic() {
+    const std::string dir = "sql_server_basic";
+    std::filesystem::remove_all(dir);
+    const uint16_t port = 15501;
+    // Database and SqlServer are scoped to this block so both are fully
+    // destructed (closing every open file handle) before the trailing
+    // remove_all() below runs -- removing the directory while Database's
+    // PageManagers still have files open fails on Windows.
+    {
+    Database db(dir);
+    SqlServer server(db, port);
+    server.start();
+
+    TEST("CREATE/INSERT/SELECT/UPDATE/DELETE over a real TCP connection get well-formed responses") {
+        SOCKET client = sqlConnect(port);
+
+        assert(sqlSendAndRecv(client, "CREATE TABLE users (id string PRIMARY KEY, name string);") ==
+               "OK\n");
+        assert(sqlSendAndRecv(client, "INSERT INTO users VALUES ('1', 'Alice');") ==
+               "OK 1 rows affected\n");
+        assert(sqlSendAndRecv(client, "INSERT INTO users VALUES ('2', 'Bob');") ==
+               "OK 1 rows affected\n");
+
+        assert(sqlSendAndRecv(client, "SELECT * FROM users;") == "id|name\n1|Alice\n2|Bob\nOK 2 rows\n");
+
+        assert(sqlSendAndRecv(client, "UPDATE users SET name = 'Alice2' WHERE id = '1';") ==
+               "OK 1 rows affected\n");
+        assert(sqlSendAndRecv(client, "DELETE FROM users WHERE id = '2';") ==
+               "OK 1 rows affected\n");
+        assert(sqlSendAndRecv(client, "SELECT name FROM users WHERE id = '1';") ==
+               "name\nAlice2\nOK 1 rows\n");
+
+        std::string err = sqlSendAndRecv(client, "SELECT * FROM nonexistent;");
+        assert(err.rfind("ERROR:", 0) == 0);
+
+        closesocket(client);
+    } END_TEST;
+
+    TEST("multiple ';'-terminated statements sent in one packet each get their own response, in order") {
+        SOCKET client = sqlConnect(port);
+        std::string batch =
+            "CREATE TABLE t (id string PRIMARY KEY);"
+            "INSERT INTO t VALUES ('x');"
+            "SELECT * FROM t;";
+        assert(sqlSendAndRecv(client, batch) == "OK\nOK 1 rows affected\nid\nx\nOK 1 rows\n");
+        closesocket(client);
+    } END_TEST;
+
+    TEST("BEGIN/COMMIT over a real connection groups statements atomically, same as the Table API") {
+        SOCKET client = sqlConnect(port);
+        sqlSendAndRecv(client, "CREATE TABLE t2 (id string PRIMARY KEY);");
+
+        assert(sqlSendAndRecv(client, "BEGIN;") == "OK\n");
+        sqlSendAndRecv(client, "INSERT INTO t2 VALUES ('a');");
+        assert(sqlSendAndRecv(client, "COMMIT;") == "OK\n");
+        assert(sqlSendAndRecv(client, "SELECT * FROM t2;") == "id\na\nOK 1 rows\n");
+
+        closesocket(client);
+    } END_TEST;
+
+    server.stop();
+    }  // db, server destructed here -- file handles closed
+    std::filesystem::remove_all(dir);
+}
+
 static void test_sql() {
     test_sql_lexer();
     test_sql_parser();
     test_sql_executor_crud();
     test_sql_executor_typed_where();
     test_sql_executor_transactions();
+    test_sql_server_basic();
 }
 
 // ─── MVCC (Phase 5) ────────────────────────────────────────────────────────
