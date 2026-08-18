@@ -11,6 +11,11 @@ Built in seven phases, each mirroring how a real database (PostgreSQL, InnoDB) i
 concept — see [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full phase-by-phase build log, and
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for real, captured numbers.
 
+**[Try it live](https://sidhesha.github.io/db_engine-console/)** — a browser SQL console
+([source](https://github.com/sidhesha/db_engine-console)) talking to this exact engine over a real
+TCP connection, not a mock. Free-tier hosting, so the backend sleeps after ~15 min idle — the first
+query after a quiet spell can take 30-60s to wake it up.
+
 ## Highlights
 
 - **B+ tree index** with latch crabbing (hand-over-hand) and a B-link design, so reads, writes,
@@ -31,6 +36,8 @@ concept — see [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full phase-by-phase
   0% — the literal scenario LRU-2 exists to solve.
 - **Model-based fuzz testing**: a shadow model cross-checked against thousands of random operations,
   catching silent wrong-answer bugs, not just crashes.
+- **Runs on Windows and Linux**: the SQL server's networking layer builds against Winsock2 or POSIX
+  sockets behind one small compat shim — CI builds and runs the full test suite on both.
 
 ## Architecture
 
@@ -39,7 +46,7 @@ concept — see [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full phase-by-phase
                                    │  ';'-terminated SQL text
                                    ▼
                      ┌─────────────────────────┐
-                     │        SqlServer         │  Winsock2, one thread/connection
+                     │        SqlServer         │  Winsock2/POSIX, one thread/connection
                      └────────────┬─────────────┘
                                    ▼
                      ┌─────────────────────────┐
