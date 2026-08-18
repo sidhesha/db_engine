@@ -112,5 +112,5 @@ clock hand around the pool multiple times evicts every hot page just like
 anything else. LRU-2 structurally can't do that: a once-touched scan page
 always outranks a twice-touched hot page for eviction, so the entire scan
 cycles through scan pages among themselves and never touches the hot set.
-Also covered by a real assertion in `test.cpp` (`test_eviction_policy_shootout`),
+Also covered by a real assertion in `tests/test.cpp` (`test_eviction_policy_shootout`),
 not just this printed number.
