@@ -22,8 +22,8 @@ a hard bug" question is fishing for.
   separately, via `propagateSplit()`.
 - A single `structure_latch` (shared for traversals, exclusive for `propagateSplit()` and
   `remove()`) serializes all structural changes against each other and against readers —
-  see `include/bplustree.hpp` for the full rationale.
-- The repro: `test.cpp`'s `test_concurrent_insert_remove()` — 3 threads removing a disjoint
+  see `include/db_engine/bplustree.hpp` for the full rationale.
+- The repro: `tests/test.cpp`'s `test_concurrent_insert_remove()` — 3 threads removing a disjoint
   key range concurrently with 3 threads inserting a disjoint (higher) key range, against a
   tree that already has ~300 keys and several levels. Run in a loop (300 iterations) on
   GitHub Actions CI, not locally (see "How this was debugged" below).
@@ -114,7 +114,7 @@ parent that's since been merged away (its own weak_ptr chain can point at one), 
 `ancestor_hints` fallback skips dead entries the same way — both needed the same guard,
 since either could hand back a dead-but-still-resolvable node.
 
-**Files:** `include/node.hpp` (the flag), `src/bplustree.cpp` (`handleLeafUnderflow`,
+**Files:** `include/db_engine/node.hpp` (the flag), `src/bplustree.cpp` (`handleLeafUnderflow`,
 `handleInternalUnderflow`, `getParent`, `propagateSplit`).
 
 ---
