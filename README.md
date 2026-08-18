@@ -1,20 +1,45 @@
+<div align="center">
+
 # db_engine
 
+**A relational database engine, written from scratch in C++17.**
+
+B+ tree index · buffer pool · latch-crabbing concurrency · write-ahead log · MVCC transactions · SQL over TCP
+
 [![Build & Test](https://github.com/sidhesha/db_engine/actions/workflows/build.yml/badge.svg)](https://github.com/sidhesha/db_engine/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C.svg?logo=c%2B%2B)](https://en.cppreference.com/w/cpp/17)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg)](.github/workflows/build.yml)
 
-A relational database engine written from scratch in C++17 — no external database library, no
-ORM. Disk-persistent B+ tree index, a clock-sweep/LRU-2 buffer pool, real latch-crabbing
-concurrency, an ARIES-style write-ahead log, MVCC transactions with snapshot isolation, and a SQL
-frontend served over a real TCP socket.
+[**Try it live →**](https://sidhesha.github.io/db_engine-console/)
 
-Built in seven phases, each mirroring how a real database (PostgreSQL, InnoDB) implements the same
-concept — see [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full phase-by-phase build log, and
+</div>
+
+---
+
+No external database library, no ORM — every layer below is built from first principles and
+mirrors how a real database (PostgreSQL, InnoDB) implements the same concept. Seven phases, each
+independently demo-able: see [`docs/ROADMAP.md`](docs/ROADMAP.md) for the full build log and
 [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) for real, captured numbers.
 
-**[Try it live](https://sidhesha.github.io/db_engine-console/)** — a browser SQL console
-([source](https://github.com/sidhesha/db_engine-console)) talking to this exact engine over a real
-TCP connection, not a mock. Free-tier hosting, so the backend sleeps after ~15 min idle — the first
-query after a quiet spell can take 30-60s to wake it up.
+<p align="center">
+  <a href="https://sidhesha.github.io/db_engine-console/">
+    <img src="docs/assets/console-screenshot.png" alt="db_engine web console — a live SQL session" width="820">
+  </a>
+  <br>
+  <sub>The web console above talks to this exact engine over a real TCP connection — <a href="https://sidhesha.github.io/db_engine-console/">try it yourself</a>.</sub>
+</p>
+
+## Contents
+
+- [Highlights](#highlights)
+- [Architecture](#architecture)
+- [Quick start](#quick-start)
+- [Testing & benchmarking](#testing--benchmarking)
+- [Project structure](#project-structure)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Highlights
 
@@ -141,13 +166,19 @@ db_engine/
 
 ## Documentation
 
-- [`docs/ROADMAP.md`](docs/ROADMAP.md) — every phase's design decisions, what was built, and why,
-  written as the project progressed rather than after the fact.
-- [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — real, machine-labeled numbers: insert throughput,
-  point lookup latency, range scan speed, cache-vs-no-cache, single-vs-concurrent, and the
-  eviction policy shootout.
-- [`docs/CONCURRENCY_BUGS.md`](docs/CONCURRENCY_BUGS.md) — five related concurrency bugs found
-  during development (root causes, fixes, and the debugging methodology used to find them).
+| | |
+|---|---|
+| [`docs/ROADMAP.md`](docs/ROADMAP.md) | Every phase's design decisions, what was built, and why — written as the project progressed, not after the fact. |
+| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Real, machine-labeled numbers: throughput, latency, cache-vs-no-cache, single-vs-concurrent, the eviction shootout. |
+| [`docs/CONCURRENCY_BUGS.md`](docs/CONCURRENCY_BUGS.md) | Five related concurrency bugs found during development — root causes, fixes, and the debugging methodology used to find them. |
+
+**Related:** [`db_engine-console`](https://github.com/sidhesha/db_engine-console) — the web SQL
+console shown above (browser frontend + a thin WebSocket↔TCP bridge to this engine).
+
+## Contributing
+
+See [`AGENTS.md`](AGENTS.md) for the build/test/PR workflow — TL;DR: branch, write a failing test,
+implement, run the full suite, open a PR. CI must be green before merging.
 
 ## License
 
