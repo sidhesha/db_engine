@@ -3,7 +3,7 @@ name: Build & Test
 on: [push, pull_request]
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
     defaults:
       run:
@@ -24,3 +24,19 @@ jobs:
         run: cmake --build build
       - name: Test
         run: build/db_engine_test.exe
+
+  build-linux:
+    # Real verification that SqlServer's POSIX-socket branch (see
+    # include/db_engine/sqlserver.hpp's compat shim) actually builds and
+    # passes the full suite, including its socket-based tests -- not an
+    # assumption. This is also the platform the web console's backend
+    # container is built from.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: build/db_engine_test

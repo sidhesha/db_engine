@@ -15,6 +15,11 @@ set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -g3 -O0")
 # Include directories
 include_directories(include)
 
+# std::thread needs this linked explicitly on some platforms/libc
+# combinations (not all -- glibc on recent Ubuntu folds it into libc, but
+# this stays portable rather than relying on that).
+find_package(Threads REQUIRED)
+
 # Source files
 set(SOURCES
     src/bplustree.cpp
@@ -40,17 +45,26 @@ set(SOURCES
     src/evictionpolicy.cpp
 )
 
+# ws2_32 (Winsock2) only exists on Windows -- SqlServer's POSIX-socket
+# branch (see include/db_engine/sqlserver.hpp) needs nothing extra on
+# Linux/macOS beyond the pthread link above.
+if(WIN32)
+    set(PLATFORM_LIBS ws2_32)
+else()
+    set(PLATFORM_LIBS)
+endif()
+
 # Main executable
 add_executable(db_engine src/main.cpp ${SOURCES})
-target_link_libraries(db_engine ws2_32)
+target_link_libraries(db_engine Threads::Threads ${PLATFORM_LIBS})
 
 # Test executable
 add_executable(db_engine_test tests/test.cpp ${SOURCES})
-target_link_libraries(db_engine_test ws2_32)
+target_link_libraries(db_engine_test Threads::Threads ${PLATFORM_LIBS})
 
 # Benchmark executable. Always built optimized regardless of the active
 # CMAKE_BUILD_TYPE -- a benchmark run against the -O0 debug build the
 # test suite uses would produce meaningless numbers.
 add_executable(db_engine_bench bench/bench.cpp ${SOURCES})
-target_link_libraries(db_engine_bench ws2_32)
+target_link_libraries(db_engine_bench Threads::Threads ${PLATFORM_LIBS})
 target_compile_options(db_engine_bench PRIVATE -O2)

@@ -7,6 +7,23 @@
 #include "db_engine/parser.hpp"
 
 namespace {
+// Winsock needs an explicit init/teardown pair around any socket use;
+// BSD sockets need nothing here. Centralized so the constructor/
+// destructor below don't repeat an #ifdef at every call site (three
+// error paths in the constructor alone).
+#ifdef _WIN32
+void platformSocketInit() {
+    WSADATA wsa_data;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
+        throw std::runtime_error("SqlServer: WSAStartup failed");
+    }
+}
+void platformSocketCleanup() { WSACleanup(); }
+#else
+void platformSocketInit() {}
+void platformSocketCleanup() {}
+#endif
+
 std::string formatResult(const Stmt& stmt, const QueryResult& result) {
     if (!result.ok) {
         return "ERROR: " + result.message + "\n";
@@ -37,22 +54,21 @@ std::string formatResult(const Stmt& stmt, const QueryResult& result) {
 }  // namespace
 
 SqlServer::SqlServer(Database& db, uint16_t port) : db(db), port(port) {
-    WSADATA wsa_data;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
-        throw std::runtime_error("SqlServer: WSAStartup failed");
-    }
+    platformSocketInit();
 
     listen_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listen_socket == INVALID_SOCKET) {
-        WSACleanup();
+        platformSocketCleanup();
         throw std::runtime_error("SqlServer: socket() failed");
     }
 
     // Lets a server restarted on the same port bind immediately instead
     // of failing with "address already in use" while the OS still has
     // the previous socket lingering in TIME_WAIT -- relevant for tests
-    // that start/stop a server repeatedly against a fixed port.
-    BOOL reuse = TRUE;
+    // that start/stop a server repeatedly against a fixed port. `int`
+    // (not Windows' BOOL) works identically on both platforms here --
+    // BOOL is itself just `typedef int BOOL` in the Windows headers.
+    int reuse = 1;
     setsockopt(listen_socket, SOL_SOCKET, SO_REUSEADDR,
                reinterpret_cast<const char*>(&reuse), sizeof(reuse));
 
@@ -63,13 +79,13 @@ SqlServer::SqlServer(Database& db, uint16_t port) : db(db), port(port) {
 
     if (bind(listen_socket, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
         closesocket(listen_socket);
-        WSACleanup();
+        platformSocketCleanup();
         throw std::runtime_error("SqlServer: bind() failed on port " + std::to_string(port));
     }
 
     if (listen(listen_socket, SOMAXCONN) == SOCKET_ERROR) {
         closesocket(listen_socket);
-        WSACleanup();
+        platformSocketCleanup();
         throw std::runtime_error("SqlServer: listen() failed");
     }
 }
@@ -79,7 +95,7 @@ SqlServer::~SqlServer() {
     if (listen_socket != INVALID_SOCKET) {
         closesocket(listen_socket);
     }
-    WSACleanup();
+    platformSocketCleanup();
 }
 
 void SqlServer::start() {
@@ -90,11 +106,24 @@ void SqlServer::start() {
 void SqlServer::stop() {
     if (!running.exchange(false)) return;  // already stopped (or never started)
 
-    // Winsock has no separate "cancel a blocked accept()" call -- closing
-    // the listening socket is what unblocks the accept-loop thread.
+    // acceptLoop() polls `running` at least every ~200ms (see below)
+    // rather than blocking indefinitely in accept(), so this join always
+    // returns promptly on its own -- no separate "cancel a blocked
+    // accept()" trick needed. That matters because there isn't a
+    // portable one: Windows' closesocket() reliably wakes a *different*
+    // thread's blocking call on the same socket, but POSIX leaves that
+    // case unspecified, and on Linux specifically another thread's
+    // accept() often does NOT wake up when the fd is merely closed
+    // elsewhere -- confirmed the hard way, this hung the test suite
+    // indefinitely the first time this port ran in CI on Linux. Only
+    // touching listen_socket here, after the accept thread has fully
+    // joined (and so provably isn't reading it anymore), also avoids a
+    // data race that a "close it to unblock the other thread" approach
+    // would otherwise have on this member.
+    if (accept_thread.joinable()) accept_thread.join();
+
     closesocket(listen_socket);
     listen_socket = INVALID_SOCKET;
-    if (accept_thread.joinable()) accept_thread.join();
 
     std::lock_guard<std::mutex> lock(conn_mu);
     for (auto& t : connection_threads) {
@@ -104,15 +133,31 @@ void SqlServer::stop() {
 }
 
 void SqlServer::acceptLoop() {
+    // Captured once: stable for this thread's whole lifetime by
+    // construction (stop() -- the only thing that ever changes
+    // listen_socket -- only runs after this thread has already started,
+    // per this class's documented start()-then-stop() contract, and only
+    // touches listen_socket again after joining this thread; see stop()).
+    SOCKET fd = listen_socket;
+
     while (running) {
+        // Poll with a short timeout rather than blocking in accept()
+        // indefinitely, so stop() setting `running = false` is always
+        // noticed within one poll interval instead of relying on
+        // unblocking a concurrent blocking call from another thread --
+        // see stop()'s comment for why that isn't portable.
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(fd, &readfds);
+        timeval tv{0, 200000};  // 200ms
+        int ready = select(static_cast<int>(fd) + 1, &readfds, nullptr, nullptr, &tv);
+        if (ready <= 0) continue;  // timeout, or a transient error -- recheck `running`
+
         sockaddr_in client_addr{};
-        int addr_len = sizeof(client_addr);
-        SOCKET client = accept(listen_socket, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
+        addrlen_t addr_len = sizeof(client_addr);
+        SOCKET client = accept(fd, reinterpret_cast<sockaddr*>(&client_addr), &addr_len);
         if (client == INVALID_SOCKET) {
-            // Either a real transient error, or stop() just closed
-            // listen_socket out from under this call -- `running` being
-            // false in that case is what ends the loop, not a retry.
-            continue;
+            continue;  // transient -- select() said readable but accept() still failed
         }
 
         std::lock_guard<std::mutex> lock(conn_mu);
